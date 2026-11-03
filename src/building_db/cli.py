@@ -51,4 +51,30 @@ def _import(args) -> int:
 
 
 def _report(args) -> int:
-    raise NotImplementedError
+    import sqlite3
+
+    from building_db.calc import room_area_m2, room_perimeter_m, wall_lengths_m
+
+    if not args.db.exists():
+        print(f"Database not found: {args.db}")
+        return 1
+    conn = sqlite3.connect(args.db)
+    try:
+        print("Rooms (measured on wall centers; calculated, not stored)")
+        rooms = conn.execute("SELECT room_id, room_no, name, ceiling_height FROM rooms ORDER BY room_id").fetchall()
+        for room_id, room_no, name, ceiling in rooms:
+            area = room_area_m2(conn, room_id)
+            perimeter = room_perimeter_m(conn, room_id)
+            print(f"  {room_id}  {room_no or '-'} {name or '-'}  "
+                  f"area {area:.2f} m2  perimeter {perimeter:.3f} m  ceiling height {ceiling or '-'} mm")
+
+        print("Walls (adopted wall center length)")
+        types = dict(conn.execute(
+            "SELECT w.wall_id, t.type_code FROM walls w LEFT JOIN wall_types t ON t.type_id = w.wall_type_id"))
+        lengths = wall_lengths_m(conn)
+        for wall_id, length in lengths.items():
+            print(f"  {wall_id}  {types.get(wall_id) or '-'}  {length:.3f} m")
+        print(f"  total {sum(lengths.values()):.3f} m ({len(lengths)} walls)")
+    finally:
+        conn.close()
+    return 0
