@@ -12,17 +12,25 @@ Nothing here is corrected silently: anything unexpected becomes a warning.
 from __future__ import annotations
 
 import io
+import logging
 import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import ezdxf
 from ezdxf import recover
 
 from building_db.layers import FIXED_LAYERS, GRID
 
 # Jw_cad writes layers as "_<group>-<layer>_<name>", group and layer in hex 0-F.
 _JW_PREFIX = re.compile(r"^_[0-9A-Fa-f]-[0-9A-Fa-f]_")
+
+# Code page assumed when the header has none (Jw_cad writes Shift_JIS).
+_ASSUMED_CODEPAGE = b"ANSI_932"
+
+# ezdxf log message for a handle used twice, e.g. "non-unique entity handle #3".
+_DUPLICATE_HANDLE = re.compile(r"non-unique entity handle #(\w+)")
 
 # $INSUNITS value for millimeters.
 _INSUNITS_MM = 4
@@ -56,6 +64,23 @@ class Grid:
     position: float
 
 
+@dataclass(frozen=True)
+class ReadConditions:
+    """How the file was read. Stored with the import batch."""
+
+    reader: str
+    recover_mode: bool
+    dxf_version: str
+    encoding: str
+    encoding_assumed: bool  # True if $DWGCODEPAGE was missing and assumed
+    # File-format repairs made by ezdxf (e.g. unnamed table entries).
+    repairs: list[str]
+    # Entity handles that appeared more than once in the file.
+    duplicate_handles: list[str]
+    unit: str = "mm"
+    unit_assumed: bool = True  # SPEC.md 2: no $INSUNITS in the samples
+
+
 @dataclass
 class Drawing:
     path: Path
@@ -64,10 +89,13 @@ class Drawing:
     texts: list[Text]
     grids: list[Grid]
     origin: tuple[float, float]  # raw DXF coordinates of the X1/Y1 intersection
+    conditions: ReadConditions
     # Drawing-level problems a person should look at.
     warnings: list[str] = field(default_factory=list)
-    # File-format repairs made by ezdxf (e.g. unnamed table entries).
-    repairs: list[str] = field(default_factory=list)
+
+    @property
+    def repairs(self) -> list[str]:
+        return self.conditions.repairs
 
     def lines_on(self, layer: str) -> list[Line]:
         return [ln for ln in self.lines if ln.layer == layer]
@@ -86,7 +114,7 @@ def read_drawing(path: Path) -> Drawing:
     path = Path(path)
     warnings: list[str] = []
 
-    doc, repairs = _read_document(path)
+    doc, conditions = _read_document(path)
     _check_units(doc, warnings)
 
     layers = sorted({normalize_layer_name(layer.dxf.name) for layer in doc.layers})
@@ -123,26 +151,63 @@ def read_drawing(path: Path) -> Drawing:
             for g in raw_grids
         ],
         origin=origin,
+        conditions=conditions,
         warnings=warnings,
-        repairs=repairs,
     )
 
 
 def _read_document(path: Path):
-    """Read with ezdxf's recover mode; return (document, repair messages).
+    """Read with ezdxf's recover mode; return (document, ReadConditions).
 
     Jw_cad exports have table entries without names and duplicate handles,
     which the strict loader rejects. Recover mode repairs them, and the
     repairs are reported instead of being hidden.
     """
     data = path.read_bytes()
+    encoding_assumed = False
     if b"$DWGCODEPAGE" not in data[:4096]:
         # Without $DWGCODEPAGE ezdxf decodes text as cp1252, which garbles
         # Japanese. Insert the code page into an in-memory copy only.
-        data = _insert_codepage(data, b"ANSI_932")
-    doc, auditor = recover.read(io.BytesIO(data))
-    repairs = [f"{e.message}" for e in auditor.fixes] + [f"{e.message}" for e in auditor.errors]
-    return doc, repairs
+        data = _insert_codepage(data, _ASSUMED_CODEPAGE)
+        encoding_assumed = True
+
+    # ezdxf only logs some findings (e.g. duplicate handles); capture them.
+    capture = _CaptureHandler()
+    logger = logging.getLogger("ezdxf")
+    logger.addHandler(capture)
+    try:
+        doc, auditor = recover.read(io.BytesIO(data))
+    finally:
+        logger.removeHandler(capture)
+
+    duplicates = []
+    logged = []
+    for message in capture.messages:
+        m = _DUPLICATE_HANDLE.search(message)
+        if m:
+            duplicates.append(m.group(1))
+        else:
+            logged.append(message)
+
+    conditions = ReadConditions(
+        reader=f"ezdxf {ezdxf.__version__} recover",
+        recover_mode=True,
+        dxf_version=doc.dxfversion,
+        encoding=doc.encoding,
+        encoding_assumed=encoding_assumed,
+        repairs=[e.message for e in auditor.fixes] + [e.message for e in auditor.errors] + logged,
+        duplicate_handles=duplicates,
+    )
+    return doc, conditions
+
+
+class _CaptureHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
 
 
 def _insert_codepage(data: bytes, codepage: bytes) -> bytes:
