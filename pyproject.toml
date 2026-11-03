@@ -24,3 +24,4 @@ building_db = ["schema.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
