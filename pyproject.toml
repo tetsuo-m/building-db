@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "building-db"
+version = "0.1.0"
+description = "Link design decisions and their basis to drawing elements"
+requires-python = ">=3.11"
+dependencies = [
+    "ezdxf",  # MIT
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",  # MIT
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+building_db = ["schema.sql"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
