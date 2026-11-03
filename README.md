@@ -10,10 +10,12 @@ Built for the hackathon "Built with Claude: Japan 2026".
 All sample data is fictional and contains no company information.
 
 - `samples/step1/`: Test data created after the hackathon started (2026-11-03), with the help of Claude in the claude.ai chat (not Claude Code).
+- `samples/step2/`: Test data created after the hackathon started (2026-11-03). The DXF files (`step2.dxf`, `step2_moved.dxf`, `step2_boundary_only.dxf`) were drawn by the designer in Jw_cad. `expected.md` and `expected_diff.md` were written with the help of Claude in the claude.ai chat (not Claude Code).
 
 サンプルデータはすべて架空のもので、会社の情報は含みません。
 
 - `samples/step1/`：ハッカソン開始後（2026-11-03）に、claude.ai のチャットの Claude（Claude Code ではない）の補助で作成したテストデータです。
+- `samples/step2/`：ハッカソン開始後（2026-11-03）に作成したテストデータです。DXF（`step2.dxf`、`step2_moved.dxf`、`step2_boundary_only.dxf`）は、設計者が Jw_cad で描きました。`expected.md` と `expected_diff.md` は、claude.ai のチャットの Claude（Claude Code ではない）の補助で作成しました。
 
 ## Libraries / 使用ライブラリ
 
