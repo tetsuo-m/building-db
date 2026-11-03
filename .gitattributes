@@ -1,0 +1,2 @@
+# Keep sample files byte-identical (no line-ending conversion)
+samples/** -text
