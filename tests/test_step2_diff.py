@@ -210,7 +210,6 @@ def changes_of(diff, kind, field):
 # --- Taking a snapshot before importing ---------------------------------------
 
 
-@NEEDS_VERSIONS
 def test_snapshot_keeps_the_base_version(tmp_path):
     # SPEC.md 8: copy the DB into a snapshot before importing a new version
     from building_db.versions import take_snapshot
@@ -377,7 +376,6 @@ def test_moved_no_wall_deviation(moved):
     assert moved.result.wall_deviations == []
 
 
-@NEEDS_VERSIONS
 def test_moved_diff_nothing_added_or_missing(moved):
     from building_db.versions import diff_versions
 
@@ -386,7 +384,6 @@ def test_moved_diff_nothing_added_or_missing(moved):
     assert list(diff.missing) == []
 
 
-@NEEDS_VERSIONS
 def test_moved_diff_nodes(moved):
     # Diff table: only the two T-junction nodes change, x +500
     from building_db.versions import diff_versions
@@ -398,7 +395,6 @@ def test_moved_diff_nodes(moved):
     }
 
 
-@NEEDS_VERSIONS
 def test_moved_diff_edge_lengths(moved):
     # Diff table: south and north edges change; the partition stays 4.000 m
     from building_db.versions import diff_versions
@@ -412,7 +408,6 @@ def test_moved_diff_edge_lengths(moved):
     assert changes[edges["north_right"]] == pytest.approx((3.7, 3.2))
 
 
-@NEEDS_VERSIONS
 def test_moved_diff_wall(moved):
     # Diff table: only the partition wall changes position
     from building_db.versions import diff_versions
@@ -422,7 +417,6 @@ def test_moved_diff_wall(moved):
     }
 
 
-@NEEDS_VERSIONS
 def test_moved_diff_rooms(moved):
     # Diff table: left +2.00 m2 and +1.000 m, right -2.00 m2 and -1.000 m
     from building_db.versions import diff_versions
