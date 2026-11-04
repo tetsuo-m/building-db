@@ -50,7 +50,6 @@ DECIDED_ON = "2026-11-04"
 # Marks for behavior that is not implemented yet. strict=True makes an
 # unexpected pass fail, so a mark cannot stay on a test that already works.
 # Remove a mark only with the approval of the project owner.
-NEEDS_ID_MATCHING = pytest.mark.xfail(strict=True, reason="IDs are not carried over when positions move")
 NEEDS_DEVIATION = pytest.mark.xfail(strict=True, reason="a wall deviation is not reported as one item")
 NEEDS_VERSIONS = pytest.mark.xfail(strict=True, reason="building_db.versions is not implemented")
 
@@ -233,7 +232,6 @@ def test_snapshot_keeps_the_base_version(tmp_path):
 # --- Both new versions: boundaries and rooms ----------------------------------
 
 
-@NEEDS_ID_MATCHING
 def test_counts(either):
     # "変わらないもの": 4 grids, 6 nodes, 7 edges, 2 rooms, 5 walls
     conn = either.conn
@@ -247,28 +245,23 @@ def test_grid_ids_kept(either):
     assert dict(either.conn.execute("SELECT label, grid_id FROM grids")) == either.base.grids
 
 
-@NEEDS_ID_MATCHING
 def test_node_ids_kept(either):
     # "変わらないもの": all node IDs are the same as in the base version
     assert ids(either.conn, "nodes", "node_id") == set(either.base.nodes.values())
 
 
-@NEEDS_ID_MATCHING
 def test_edge_ids_kept(either):
     assert ids(either.conn, "edges", "edge_id") == set(either.base.edges.values())
 
 
-@NEEDS_ID_MATCHING
 def test_room_ids_kept(either):
     assert ids(either.conn, "rooms", "room_id") == set(either.base.rooms.values())
 
 
-@NEEDS_ID_MATCHING
 def test_wall_ids_kept(either):
     assert ids(either.conn, "walls", "wall_id") == set(either.base.walls.values())
 
 
-@NEEDS_ID_MATCHING
 def test_t_junctions_moved(either):
     # "変わるもの": T-junction nodes move from x = 2300 to x = 2800
     base, conn = either.base, either.conn
@@ -282,7 +275,6 @@ def test_corner_nodes_not_moved(either):
         assert node_position(conn, base.nodes[position]) == position
 
 
-@NEEDS_ID_MATCHING
 def test_edge_lengths(either):
     # "変わるもの": south and north edges change by 0.500 m
     base, conn = either.base, either.conn
@@ -294,14 +286,12 @@ def test_edge_lengths(either):
     })
 
 
-@NEEDS_ID_MATCHING
 def test_partition_edge_position(either):
     # "変わるもの": the partition edge moves to x = 2800, length stays 4.000 m
     base, conn = either.base, either.conn
     assert {x for x, _ in edge_points(conn, base.edges["partition"])} == {2800}
 
 
-@NEEDS_ID_MATCHING
 def test_left_room(either):
     # "変わるもの": left room 11.20 m2, 13.600 m; no name, ceiling height not set
     from building_db.calc import room_area_m2, room_perimeter_m
@@ -326,7 +316,6 @@ def test_right_room(either):
     ).fetchone() == ("101", "事務室", 2700)
 
 
-@NEEDS_ID_MATCHING
 def test_totals(either):
     # "変わらない合計": area 24.00 m2, perimeters 28.000 m, edges 24.000 m, walls 24.000 m
     from building_db.calc import room_area_m2, room_perimeter_m, wall_lengths_m
@@ -339,7 +328,6 @@ def test_totals(either):
     assert sum(wall_lengths_m(conn).values()) == pytest.approx(24.000)
 
 
-@NEEDS_ID_MATCHING
 def test_wall_types(either):
     # "変わらないもの": all 5 walls are WT-3
     rows = either.conn.execute(
@@ -348,7 +336,6 @@ def test_wall_types(either):
     assert rows == [("WT-3",)] * 5
 
 
-@NEEDS_ID_MATCHING
 def test_outer_walls_not_moved(either):
     # "比較する図面": the 4 outer walls do not move
     assert_walls_identified(either)
@@ -371,7 +358,6 @@ def test_calculated_values_are_not_stored(either):
 # --- step2_moved.dxf ----------------------------------------------------------
 
 
-@NEEDS_ID_MATCHING
 def test_moved_partition_wall(moved):
     # "変わるもの": the partition wall moves to x = 2800, both observed and adopted
     wall_id = moved.base.walls["partition"]
@@ -456,7 +442,6 @@ def test_moved_diff_rooms(moved):
 # --- step2_boundary_only.dxf: the wall does not move --------------------------
 
 
-@NEEDS_ID_MATCHING
 def test_boundary_only_observed_wall(boundary_only):
     # "壁は動かさない": observed position x = 2300
     assert_walls_identified(boundary_only)
@@ -464,7 +449,6 @@ def test_boundary_only_observed_wall(boundary_only):
     assert wall_points(boundary_only.conn, wall_id, "observed_geometry") == ((2300, 0), (2300, 4000))
 
 
-@NEEDS_ID_MATCHING
 def test_boundary_only_adopted_wall(boundary_only):
     # "壁は動かさない": adopted position stays at x = 2300 without approval
     assert_walls_identified(boundary_only)
@@ -472,7 +456,6 @@ def test_boundary_only_adopted_wall(boundary_only):
     assert wall_points(boundary_only.conn, wall_id, "adopted_geometry") == ((2300, 0), (2300, 4000))
 
 
-@NEEDS_ID_MATCHING
 def test_boundary_only_wall_still_follows_the_edge(boundary_only):
     # "壁は動かさない": expected position comes from the edge the wall follows
     assert_walls_identified(boundary_only)
@@ -484,7 +467,6 @@ def test_boundary_only_wall_still_follows_the_edge(boundary_only):
     ).fetchall() == [(base.edges["partition"],)]
 
 
-@NEEDS_ID_MATCHING
 def test_boundary_only_wall_length(boundary_only):
     # "壁は動かさない": the partition stays 4.000 m
     from building_db.calc import wall_lengths_m

@@ -5,16 +5,16 @@ the DB stay as they were. Problems are returned as review flags and never
 fixed silently.
 
 On re-import, existing entities are matched and keep their IDs:
-grids by label, nodes by position (within the tolerance), edges by their
-two nodes, rooms by their boundary edges (then by room number), walls by the
-edges they follow, wall types by type code.
+grids by label, nodes as decided in matching.py (position, then connections),
+edges by their two nodes, rooms by their boundary edges (then by room number),
+walls by the edges they follow (then as decided in matching.py), wall types by
+type code.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -24,6 +24,7 @@ from pathlib import Path
 from building_db.db import connect, next_id
 from building_db.dxf_reader import Drawing, read_drawing
 from building_db.layers import ROOM_BOUNDARY, ROOM_NAME, WALL_CENTER
+from building_db.matching import match_nodes, match_walls, on_segment, position_along
 from building_db.network import DEFAULT_TOLERANCE_MM, Network, build_network, point_in_polygon
 from building_db.tables import FinishRow, read_finish_schedule, read_wall_types
 
@@ -65,7 +66,7 @@ def import_drawing(
             batch_id = _insert_batch(conn, dxf_path, drawing)
             type_ids = _upsert_wall_types(conn, wall_type_rows)
             _upsert_grids(conn, drawing)
-            node_ids = [_node_id(conn, x, y, tol) for x, y in network.nodes]
+            node_ids = _import_nodes(conn, network, tol, flags)
             edge_ids = [_edge_id(conn, node_ids[e.start], node_ids[e.end]) for e in network.edges]
             room_ids = _import_rooms(
                 conn, drawing, network, node_ids, edge_ids, finish_rows,
@@ -162,13 +163,24 @@ def _upsert_grids(conn, drawing: Drawing) -> None:
                          (next_id(conn, "grids", "grid_id", "A-GR-", 3), g.label, g.direction, g.position))
 
 
-def _node_id(conn, x: float, y: float, tol: float) -> str:
-    for node_id, nx, ny in conn.execute("SELECT node_id, x, y FROM nodes"):
-        if math.dist((x, y), (nx, ny)) <= tol:
-            return node_id
-    node_id = next_id(conn, "nodes", "node_id", "A-ND-", 4)
-    conn.execute("INSERT INTO nodes (node_id, x, y) VALUES (?, ?, ?)", (node_id, x, y))
-    return node_id
+def _import_nodes(conn, network: Network, tol: float, flags: list[str]) -> list[str]:
+    """Return the node ID of each network node, keeping the IDs of matched nodes."""
+    prev_nodes = {node_id: (x, y) for node_id, x, y in conn.execute("SELECT node_id, x, y FROM nodes")}
+    prev_edges = conn.execute("SELECT node_start, node_end FROM edges").fetchall()
+    match = match_nodes(prev_nodes, prev_edges, network.nodes,
+                        [(e.start, e.end) for e in network.edges], tol)
+    flags.extend(match.problems)
+
+    node_ids = []
+    for i, (x, y) in enumerate(network.nodes):
+        node_id = match.matched.get(i)
+        if node_id is None:
+            node_id = next_id(conn, "nodes", "node_id", "A-ND-", 4)
+            conn.execute("INSERT INTO nodes (node_id, x, y) VALUES (?, ?, ?)", (node_id, x, y))
+        elif match.reasons[i].rule != "same_position":
+            conn.execute("UPDATE nodes SET x = ?, y = ? WHERE node_id = ?", (x, y, node_id))
+        node_ids.append(node_id)
+    return node_ids
 
 
 def _edge_id(conn, start_id: str, end_id: str) -> str:
@@ -189,6 +201,8 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
     used_texts = set()
     finishes = {r.room_no: r for r in finish_rows}
     room_ids = []
+    prev_rooms = _room_edges(conn)
+    used_rooms: set[str] = set()
 
     for face in network.faces:
         polygon = [network.nodes[n] for n in face.nodes]
@@ -213,10 +227,18 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
             names = [texts[i].text for i in inside]
             flags.append(f"Contour {polygon} has {len(inside)} room name texts: {names}")
 
-        room_id = _find_room(conn, face_edge_ids, room_no)
+        room_id, same_boundary = _find_room(conn, prev_rooms, used_rooms, face_edge_ids, room_no)
         if room_id is None:
             room_id = next_id(conn, "rooms", "room_id", "A-RM-", 3)
             conn.execute("INSERT INTO rooms (room_id) VALUES (?)", (room_id,))
+            sharing = sorted(r for r, edges in prev_rooms.items() if edges & set(face_edge_ids))
+            if sharing:
+                flags.append(f"Contour {polygon} is new room {room_id}, sharing boundary edges with "
+                             f"{', '.join(sharing)} (possible split or merge)")
+        elif not same_boundary:
+            flags.append(f"Room {room_no}: boundary changed, {room_id} keeps its ID by room number only "
+                         "(possible split or merge)")
+        used_rooms.add(room_id)
         conn.execute("UPDATE rooms SET room_no = ?, name = ? WHERE room_id = ?", (room_no, name, room_id))
         if label_source:
             _set_provenance(conn, "rooms", room_id, "room_no", "cad_import", label_source, batch_id)
@@ -248,18 +270,26 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
     return room_ids
 
 
-def _find_room(conn, face_edge_ids: list[str], room_no: str | None) -> str | None:
-    wanted = sorted(face_edge_ids)
-    for (room_id,) in conn.execute("SELECT room_id FROM rooms").fetchall():
-        edges = sorted(r[0] for r in conn.execute(
-            "SELECT edge_id FROM room_boundaries WHERE room_id = ?", (room_id,)))
-        if edges == wanted:
-            return room_id
+def _room_edges(conn) -> dict[str, set[str]]:
+    """The boundary edges of every room, before this import changes them."""
+    rooms: dict[str, set[str]] = {r[0]: set() for r in conn.execute("SELECT room_id FROM rooms")}
+    for room_id, edge_id in conn.execute("SELECT room_id, edge_id FROM room_boundaries"):
+        rooms[room_id].add(edge_id)
+    return rooms
+
+
+def _find_room(conn, prev_rooms, used_rooms, face_edge_ids: list[str],
+               room_no: str | None) -> tuple[str | None, bool]:
+    """Return (room ID or None, True if the boundary edges are the same)."""
+    wanted = set(face_edge_ids)
+    for room_id, edges in prev_rooms.items():
+        if edges == wanted and room_id not in used_rooms:
+            return room_id, True
     if room_no:
-        found = conn.execute("SELECT room_id FROM rooms WHERE room_no = ?", (room_no,)).fetchone()
-        if found:
-            return found[0]
-    return None
+        for (room_id,) in conn.execute("SELECT room_id FROM rooms WHERE room_no = ?", (room_no,)).fetchall():
+            if room_id not in used_rooms:
+                return room_id, False
+    return None, False
 
 
 def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code, batch_id, tol,
@@ -267,20 +297,33 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
     wall_ids = []
     walls_per_edge: dict[str, int] = {eid: 0 for eid in edge_ids}
 
-    for line in drawing.lines_on(WALL_CENTER):
-        a, b = sorted([(line.x1, line.y1), (line.x2, line.y2)])
-        spans = []  # (position along the wall, edge index, reversed)
+    lines = [tuple(sorted([(ln.x1, ln.y1), (ln.x2, ln.y2)])) for ln in drawing.lines_on(WALL_CENTER)]
+    all_spans = []  # per line: (position along the wall, edge index, reversed)
+    for a, b in lines:
+        spans = []
         for idx, e in enumerate(network.edges):
             p, q = network.nodes[e.start], network.nodes[e.end]
-            if _on_segment(a, b, p, tol) and _on_segment(a, b, q, tol):
-                tp, tq = _param(a, b, p), _param(a, b, q)
+            if on_segment(a, b, p, tol) and on_segment(a, b, q, tol):
+                tp, tq = position_along(a, b, p), position_along(a, b, q)
                 spans.append((min(tp, tq), idx, tp > tq))
         spans.sort()
+        all_spans.append(spans)
+
+    prev_spans = _wall_edges(conn)
+    by_edges: dict[int, str] = {}
+    for i, spans in enumerate(all_spans):
+        wall_id = _find_wall(prev_spans, set(by_edges.values()), [edge_ids[idx] for _, idx, _ in spans])
+        if wall_id is not None:
+            by_edges[i] = wall_id
+    match = match_walls(_previous_walls(conn), lines, by_edges, tol)
+    flags.extend(match.problems)
+
+    for i, (a, b) in enumerate(lines):
+        spans = all_spans[i]
         if not spans:
             flags.append(f"Wall center line {a}-{b} does not follow any boundary line")
 
-        span_edge_ids = [edge_ids[idx] for _, idx, _ in spans]
-        wall_id = _find_wall(conn, span_edge_ids)
+        wall_id = match.matched.get(i)
         geometry = json.dumps([list(a), list(b)])
         if wall_id is None:
             wall_id = next_id(conn, "walls", "wall_id", "A-WL-", 4)
@@ -302,11 +345,15 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
         _set_provenance(conn, "walls", wall_id, "observed_geometry", "cad_import",
                         f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
 
-        conn.execute("DELETE FROM wall_edge_spans WHERE wall_id = ?", (wall_id,))
-        for seq, (_, idx, rev) in enumerate(spans, start=1):
-            conn.execute("INSERT INTO wall_edge_spans (wall_id, edge_id, seq, reversed) VALUES (?, ?, ?, ?)",
-                         (wall_id, edge_ids[idx], seq, int(rev)))
-            walls_per_edge[edge_ids[idx]] += 1
+        if spans:
+            conn.execute("DELETE FROM wall_edge_spans WHERE wall_id = ?", (wall_id,))
+            for seq, (_, idx, rev) in enumerate(spans, start=1):
+                conn.execute("INSERT INTO wall_edge_spans (wall_id, edge_id, seq, reversed) VALUES (?, ?, ?, ?)",
+                             (wall_id, edge_ids[idx], seq, int(rev)))
+        # A wall matched directly keeps the edges it followed.
+        for (eid,) in conn.execute("SELECT edge_id FROM wall_edge_spans WHERE wall_id = ?", (wall_id,)):
+            if eid in walls_per_edge:
+                walls_per_edge[eid] += 1
         wall_ids.append(wall_id)
 
     for eid, count in walls_per_edge.items():
@@ -317,29 +364,27 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
     return wall_ids
 
 
-def _find_wall(conn, span_edge_ids: list[str]) -> str | None:
+def _wall_edges(conn) -> dict[str, set[str]]:
+    """The edges every wall followed, before this import changes them."""
+    walls: dict[str, set[str]] = {}
+    for wall_id, edge_id in conn.execute("SELECT wall_id, edge_id FROM wall_edge_spans"):
+        walls.setdefault(wall_id, set()).add(edge_id)
+    return walls
+
+
+def _previous_walls(conn) -> dict[str, tuple]:
+    """Each wall's line as last seen on a drawing, with its ends sorted."""
+    walls = {}
+    for wall_id, geometry in conn.execute("SELECT wall_id, observed_geometry FROM walls"):
+        walls[wall_id] = tuple(sorted(tuple(p) for p in json.loads(geometry)))
+    return walls
+
+
+def _find_wall(prev_spans, used, span_edge_ids: list[str]) -> str | None:
     if not span_edge_ids:
         return None
-    wanted = sorted(span_edge_ids)
-    for (wall_id,) in conn.execute("SELECT wall_id FROM walls").fetchall():
-        edges = sorted(r[0] for r in conn.execute(
-            "SELECT edge_id FROM wall_edge_spans WHERE wall_id = ?", (wall_id,)))
-        if edges == wanted:
+    wanted = set(span_edge_ids)
+    for wall_id, edges in prev_spans.items():
+        if edges == wanted and wall_id not in used:
             return wall_id
     return None
-
-
-def _param(a, b, p) -> float:
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    return ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / (dx * dx + dy * dy)
-
-
-def _on_segment(a, b, p, tol) -> bool:
-    length = math.dist(a, b)
-    if length == 0:
-        return math.dist(a, p) <= tol
-    t = _param(a, b, p)
-    if t * length < -tol or (1 - t) * length < -tol:
-        return False
-    dx, dy = b[0] - a[0], b[1] - a[1]
-    return abs(dy * (p[0] - a[0]) - dx * (p[1] - a[1])) / length <= tol
