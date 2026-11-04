@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
+
+from building_db.db import SchemaVersionError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,9 +26,13 @@ def main(argv: list[str] | None = None) -> int:
     p_report.add_argument("--db", type=Path, required=True)
 
     args = parser.parse_args(argv)
-    if args.command == "import":
-        return _import(args)
-    return _report(args)
+    try:
+        if args.command == "import":
+            return _import(args)
+        return _report(args)
+    except SchemaVersionError as error:
+        print(error, file=sys.stderr)
+        return 1
 
 
 def _import(args) -> int:
@@ -51,14 +58,13 @@ def _import(args) -> int:
 
 
 def _report(args) -> int:
-    import sqlite3
-
     from building_db.calc import room_area_m2, room_perimeter_m, wall_lengths_m
+    from building_db.db import open_existing
 
     if not args.db.exists():
         print(f"Database not found: {args.db}")
         return 1
-    conn = sqlite3.connect(args.db)
+    conn = open_existing(args.db)
     try:
         print("Rooms (measured on wall centers; calculated, not stored)")
         rooms = conn.execute("SELECT room_id, room_no, name, ceiling_height FROM rooms ORDER BY room_id").fetchall()
