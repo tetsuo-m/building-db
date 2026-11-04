@@ -47,11 +47,6 @@ ALIGN = "align_to_boundary"
 UNFOLLOW = "unfollow"
 DECIDED_ON = "2026-11-04"
 
-# Marks for behavior that is not implemented yet. strict=True makes an
-# unexpected pass fail, so a mark cannot stay on a test that already works.
-# Remove a mark only with the approval of the project owner.
-NEEDS_VERSIONS = pytest.mark.xfail(strict=True, reason="building_db.versions is not implemented")
-
 EDGE_NAMES = {
     frozenset({(0, 0), (2300, 0)}): "south_left",
     frozenset({(2300, 0), (6000, 0)}): "south_right",
@@ -502,7 +497,6 @@ def test_boundary_only_deviation_record(boundary_only):
 # --- Recording a decision -----------------------------------------------------
 
 
-@NEEDS_VERSIONS
 def test_decision_fields(boundary_only):
     # "判断の記録": target ID, choice, reason, basis (a person), date, premise valid
     from building_db.versions import decisions_for, record_decision
@@ -517,7 +511,6 @@ def test_decision_fields(boundary_only):
     )
 
 
-@NEEDS_VERSIONS
 def test_decision_reason_is_optional(boundary_only):
     # "理由を一言添えられる（省略もできる）"
     from building_db.versions import decisions_for, record_decision
@@ -527,7 +520,6 @@ def test_decision_reason_is_optional(boundary_only):
     assert decisions_for(boundary_only.db, wall_id)[0].reason is None
 
 
-@NEEDS_VERSIONS
 def test_align_moves_adopted_only(boundary_only):
     # "境界線に合わせる": adopted becomes x = 2800; observed stays x = 2300
     from building_db.versions import record_decision
@@ -542,7 +534,6 @@ def test_align_moves_adopted_only(boundary_only):
         conn.close()
 
 
-@NEEDS_VERSIONS
 def test_align_proposes_drawing_fix(boundary_only):
     # "境界線に合わせる": proposes moving the wall center line to x = 2800
     from building_db.versions import drawing_fix_proposals, record_decision
@@ -553,7 +544,6 @@ def test_align_proposes_drawing_fix(boundary_only):
     assert [(p.wall_id, p.position_mm) for p in proposals] == [(wall_id, 2800)]
 
 
-@NEEDS_VERSIONS
 def test_align_does_not_rewrite_the_drawing(boundary_only):
     # "図面は自動で書き換えない"
     from building_db.versions import record_decision
@@ -563,7 +553,6 @@ def test_align_does_not_rewrite_the_drawing(boundary_only):
     assert hashlib.sha256(boundary_only.dxf.read_bytes()).hexdigest() == before
 
 
-@NEEDS_VERSIONS
 def test_align_status_until_the_drawing_is_fixed(boundary_only):
     # "承認済み・図面未反映" until the drawing is fixed, also after re-importing
     from building_db.versions import record_decision, wall_status
@@ -575,7 +564,6 @@ def test_align_status_until_the_drawing_is_fixed(boundary_only):
     assert wall_status(boundary_only.db, wall_id) == "approved_not_on_drawing"
 
 
-@NEEDS_VERSIONS
 def test_align_survives_reimport(boundary_only):
     # Importing the same drawing again does not undo the approved position
     from building_db.versions import record_decision
@@ -591,7 +579,6 @@ def test_align_survives_reimport(boundary_only):
         conn.close()
 
 
-@NEEDS_VERSIONS
 def test_align_reimport_one_review_flag(boundary_only):
     # Owner's decision (2026-11-04): after "境界線に合わせる", re-importing gives
     # 1 flag (no room name); the wall stays shown as approved, not on the drawing
@@ -606,7 +593,6 @@ def test_align_reimport_one_review_flag(boundary_only):
     assert wall_status(boundary_only.db, wall_id) == "approved_not_on_drawing"
 
 
-@NEEDS_VERSIONS
 def test_align_status_clears_when_the_drawing_is_fixed(boundary_only):
     # "図面が直るまで": step2_moved.dxf has the wall center line at x = 2800
     from building_db.versions import drawing_fix_proposals, record_decision, wall_status
@@ -618,7 +604,6 @@ def test_align_status_clears_when_the_drawing_is_fixed(boundary_only):
     assert list(drawing_fix_proposals(boundary_only.db)) == []
 
 
-@NEEDS_VERSIONS
 def test_unfollow_keeps_the_wall(boundary_only):
     # "追従を外す": follow_edge is off and the wall stays at x = 2300
     from building_db.versions import record_decision, wall_status
@@ -634,7 +619,6 @@ def test_unfollow_keeps_the_wall(boundary_only):
     assert wall_status(boundary_only.db, wall_id) == "approved_exception"
 
 
-@NEEDS_VERSIONS
 def test_unfollow_reimport_keeps_the_exception(boundary_only):
     # "追従を外す", re-imported: 1 flag (no room name); the deviation stays as an
     # approved exception
@@ -651,7 +635,6 @@ def test_unfollow_reimport_keeps_the_exception(boundary_only):
     assert [(e.wall_id, e.distance_mm) for e in exceptions] == [(wall_id, pytest.approx(500))]
 
 
-@NEEDS_VERSIONS
 def test_unfollow_stays_in_report(boundary_only, capsys):
     # "レポートには残る"
     from building_db.cli import main
@@ -667,7 +650,6 @@ def test_unfollow_stays_in_report(boundary_only, capsys):
     assert wall_id in out
 
 
-@NEEDS_VERSIONS
 @pytest.mark.parametrize("choice", [ALIGN, UNFOLLOW])
 def test_decision_stays_on_the_wall_after_reimport(boundary_only, choice):
     # "記録は、次に同じ図面を取り込んでも、同じ壁に付いたまま残る"

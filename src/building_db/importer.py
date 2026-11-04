@@ -509,8 +509,27 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
         # A matched wall whose line no longer lies on the edges it follows has
         # deviated; the wall is not re-reported as a line on no edge.
         deviation = _wall_deviation(conn, wall_id, (a, b), tol) if wall_id and not spans else None
-        if not spans and deviation is None:
-            flags.append(f"Wall center line {a}-{b} does not follow any boundary line")
+        decision = latest_decision(conn, wall_id) if wall_id and not spans else None
+        keep_adopted = deviation is not None  # a deviation never moves the adopted position
+        if deviation is not None and decision is not None and decision[0] == ALIGN_TO_BOUNDARY:
+            # Approved already. Still valid only while the expected position is the one decided on.
+            _, premise = decision
+            if _same_geometry(premise["expected_geometry"], deviation.expected_geometry, tol):
+                deviation = None  # approved, not on the drawing yet: no review item
+            else:
+                conn.execute(
+                    "UPDATE decisions SET premise_valid = 0 WHERE target_id = ? AND premise_valid = 1 "
+                    "AND decision_id = (SELECT MAX(decision_id) FROM decisions WHERE target_id = ?)",
+                    (wall_id, wall_id))
+                flags.append(
+                    f"Wall {wall_id}: the premise of the approved position no longer holds; the boundary "
+                    f"edge moved from {premise['expected_geometry']} to {deviation.expected_geometry}. "
+                    "Decide again."
+                )
+        if not spans and deviation is None and not keep_adopted:
+            unfollowed = decision is not None and decision[0] == UNFOLLOW
+            if not unfollowed:
+                flags.append(f"Wall center line {a}-{b} does not follow any boundary line")
 
         if wall_id is None:
             wall_id = next_id(conn, "walls", "wall_id", "A-WL-", 4)
@@ -523,15 +542,17 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
                 candidates = match.undecided.get(i)
                 log.write("walls", wall_id, "undecided" if candidates else "added_candidate",
                           candidates=candidates, review=bool(candidates))
-        elif deviation is None:
+        elif not keep_adopted and (spans or decision is None or decision[0] != UNFOLLOW):
             conn.execute(
                 "UPDATE walls SET wall_type_id = ?, adopted_geometry = ?, observed_geometry = ? WHERE wall_id = ?",
                 (type_id, geometry, geometry, wall_id),
             )
         else:
-            # Observed changes; adopted (and its provenance) stays until a person decides.
+            # Observed changes; adopted (and its provenance) stays until a person decides,
+            # or stays as decided.
             conn.execute("UPDATE walls SET wall_type_id = ?, observed_geometry = ? WHERE wall_id = ?",
                          (type_id, geometry, wall_id))
+            keep_adopted = True
         if log and match.matched.get(i) is not None:
             reason = match.reasons[i]
             log.matched("walls", wall_id, reason.rule, reason.moved_mm, reason.anchors, tol)
@@ -539,7 +560,7 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
         _set_provenance(conn, "walls", wall_id, "wall_type_id", "designer",
                         f"default wall type {type_code} given on the import command (--default-wall-type)",
                         batch_id)
-        if deviation is None:
+        if not keep_adopted:
             _set_provenance(conn, "walls", wall_id, "adopted_geometry", "cad_import",
                             f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
         _set_provenance(conn, "walls", wall_id, "observed_geometry", "cad_import",
@@ -578,18 +599,53 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
 
 def _wall_deviation(conn, wall_id: str, line, tol: float) -> WallDeviation | None:
     """How far the drawn line is from the edges the wall follows, if it follows any."""
-    (follow,) = conn.execute("SELECT follow_edge FROM walls WHERE wall_id = ?", (wall_id,)).fetchone()
-    if not follow:
+    found = wall_deviation_now(conn, wall_id, tol, line=line)
+    if found is None:
+        return None
+    return WallDeviation(wall_id, found["edge_ids"], found["distance_mm"], found["expected"])
+
+
+def wall_deviation_now(conn, wall_id: str, tol: float, line=None, regardless_of_follow: bool = False):
+    """The deviation of a wall as things stand, or None.
+
+    Returns {"observed", "expected", "distance_mm", "edge_ids"}. The expected
+    position comes from the followed edges' current nodes and is never stored.
+    line, if given, is the drawn line to compare instead of the stored observed one.
+    """
+    follow, observed = conn.execute(
+        "SELECT follow_edge, observed_geometry FROM walls WHERE wall_id = ?", (wall_id,)).fetchone()
+    if not follow and not regardless_of_follow:
         return None
     edge_ids = [e for (e,) in conn.execute(
         "SELECT edge_id FROM wall_edge_spans WHERE wall_id = ? ORDER BY seq", (wall_id,))]
     if not edge_ids:
         return None
+    if line is None:
+        line = tuple(sorted(tuple(p) for p in json.loads(observed)))
     expected = expected_wall_geometry(conn, edge_ids)
     distance = max(math.dist(line[0], expected[0]), math.dist(line[1], expected[1]))
     if distance <= tol:
         return None
-    return WallDeviation(wall_id, edge_ids, distance, expected)
+    return {"observed": tuple(line), "expected": expected, "distance_mm": distance, "edge_ids": edge_ids}
+
+
+def latest_decision(conn, wall_id: str):
+    """(choice, premise) of the latest decision on a wall, or None."""
+    row = conn.execute(
+        "SELECT choice, premise FROM decisions WHERE target_table = 'walls' AND target_id = ? "
+        "ORDER BY decision_id DESC LIMIT 1", (wall_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    choice, premise = row
+    premise = json.loads(premise)
+    for key in ("observed_geometry", "expected_geometry"):
+        premise[key] = tuple(tuple(p) for p in premise[key])
+    return choice, premise
+
+
+def _same_geometry(a, b, tol: float) -> bool:
+    return all(math.dist(p, q) <= tol for p, q in zip(a, b))
 
 
 def expected_wall_geometry(conn, edge_ids: list[str]) -> tuple:

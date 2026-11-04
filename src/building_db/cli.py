@@ -88,6 +88,14 @@ def _report(args) -> int:
             print(f"  {wall_id}  {types.get(wall_id) or '-'}  {length:.3f} m")
         print(f"  total {sum(lengths.values()):.3f} m ({len(lengths)} walls)")
 
+        from building_db.versions import _accepted_exceptions
+
+        exceptions = _accepted_exceptions(conn)
+        if exceptions:
+            print("Approved exceptions (walls that no longer follow their boundary edge)")
+            for e in exceptions:
+                print(f"  {e.wall_id}  {e.distance_mm:.0f} mm from edge {', '.join(e.edge_ids)}")
+
         gone = conn.execute(
             "SELECT 'room', room_id, last_seen_batch FROM rooms "
             f"WHERE last_seen_batch IS NOT {LATEST_BATCH} "

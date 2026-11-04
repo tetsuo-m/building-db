@@ -86,6 +86,23 @@ CREATE TABLE IF NOT EXISTS walls (
     last_seen_batch  INTEGER REFERENCES import_batches(batch_id)
 );
 
+-- A person's decision about an element, with its basis, kept as a history.
+-- premise is what was true when the decision was made (observed and expected
+-- positions, distance): a fact of that moment, stored, not recomputed (SPEC.md 3).
+-- premise_valid turns 0 when a later drawing changes the expected position.
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_table  TEXT NOT NULL,
+    target_id     TEXT NOT NULL,
+    choice        TEXT NOT NULL,              -- e.g. align_to_boundary, unfollow
+    reason        TEXT,
+    basis_kind    TEXT NOT NULL DEFAULT 'person',
+    decided_on    TEXT NOT NULL,              -- ISO date
+    batch_id      INTEGER REFERENCES import_batches(batch_id),  -- latest import when decided
+    premise       TEXT NOT NULL,              -- JSON
+    premise_valid INTEGER NOT NULL DEFAULT 1
+);
+
 -- Why each element of a new version was (or was not) taken to be an element
 -- of the previous version. A history per import batch, never overwritten.
 -- moved_mm is a fact of that import, not a value recomputed from the current

@@ -16,10 +16,18 @@ import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import datetime as dt
+
 from building_db.calc import room_area_m2, room_perimeter_m
-from building_db.db import open_existing
+from building_db.db import connect, open_existing
+from building_db.importer import (
+    ALIGN_TO_BOUNDARY, UNFOLLOW, expected_wall_geometry, latest_decision, wall_deviation_now,
+)
 
 KINDS = ("node", "edge", "room", "wall")
+CHOICES = (ALIGN_TO_BOUNDARY, UNFOLLOW)
+STATUS_APPROVED_NOT_ON_DRAWING = "approved_not_on_drawing"
+STATUS_APPROVED_EXCEPTION = "approved_exception"
 
 
 @dataclass(frozen=True)
@@ -128,6 +136,177 @@ def _latest_elements(conn: sqlite3.Connection) -> dict[str, dict[str, dict]]:
 
 def _geometry(stored: str) -> tuple:
     return tuple(sorted(tuple(p) for p in json.loads(stored)))
+
+
+# --- Decisions ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class DecisionRecord:
+    decision_id: int
+    target_table: str
+    target_id: str
+    choice: str
+    reason: str | None
+    basis_kind: str
+    decided_on: str
+    batch_id: int | None
+    premise: dict
+    premise_valid: bool
+
+
+@dataclass(frozen=True)
+class DrawingFixProposal:
+    """The drawing should be changed to show the adopted position."""
+
+    wall_id: str
+    adopted_geometry: tuple
+    observed_geometry: tuple
+
+    @property
+    def position_mm(self) -> float | None:
+        (x1, _), (x2, _) = self.adopted_geometry
+        return x1 if abs(x1 - x2) <= 1e-6 else None
+
+
+@dataclass(frozen=True)
+class AcceptedException:
+    """A wall that, by decision, no longer follows its boundary edge."""
+
+    wall_id: str
+    distance_mm: float
+    edge_ids: list[str]
+
+
+def record_decision(db_path: Path, target_id: str, choice: str, reason: str | None = None,
+                    decided_on: str | None = None, tol: float = 1.0) -> DecisionRecord:
+    """Record a person's decision on a wall deviation and apply it.
+
+    align_to_boundary: the adopted position becomes the expected position (the
+    drawing is not changed; see drawing_fix_proposals). unfollow: the wall stops
+    following its edge and stays where it is.
+    """
+    if choice not in CHOICES:
+        raise ValueError(f"Unknown choice {choice!r}; choose one of {', '.join(CHOICES)}")
+    decided_on = decided_on or dt.date.today().isoformat()
+    conn = connect(db_path)
+    try:
+        with conn:
+            if conn.execute("SELECT 1 FROM walls WHERE wall_id = ?", (target_id,)).fetchone() is None:
+                raise ValueError(f"Wall {target_id} is not in the database")
+            deviation = wall_deviation_now(conn, target_id, tol, regardless_of_follow=True)
+            if deviation is None:
+                raise ValueError(f"Wall {target_id} has no deviation to decide on")
+            (batch_id,) = conn.execute("SELECT MAX(batch_id) FROM import_batches").fetchone()
+            premise = {
+                "observed_geometry": deviation["observed"],
+                "expected_geometry": deviation["expected"],
+                "distance_mm": deviation["distance_mm"],
+                "edge_ids": deviation["edge_ids"],
+            }
+            cur = conn.execute(
+                "INSERT INTO decisions (target_table, target_id, choice, reason, basis_kind, decided_on, "
+                "batch_id, premise, premise_valid) VALUES ('walls', ?, ?, ?, 'person', ?, ?, ?, 1)",
+                (target_id, choice, reason, decided_on, batch_id, json.dumps(premise)),
+            )
+            decision_id = cur.lastrowid
+            source = f"decision {decision_id} ({choice}) by a person on {decided_on}"
+            if choice == ALIGN_TO_BOUNDARY:
+                conn.execute("UPDATE walls SET adopted_geometry = ?, follow_edge = 1 WHERE wall_id = ?",
+                             (json.dumps([list(p) for p in deviation["expected"]]), target_id))
+                _provenance(conn, target_id, "adopted_geometry", source, batch_id)
+            else:
+                conn.execute("UPDATE walls SET follow_edge = 0 WHERE wall_id = ?", (target_id,))
+            _provenance(conn, target_id, "follow_edge", source, batch_id)
+        return decisions_for(db_path, target_id)[-1]
+    finally:
+        conn.close()
+
+
+def _provenance(conn, wall_id: str, column: str, source: str, batch_id) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO field_provenance (target_table, target_id, field, origin, source, batch_id) "
+        "VALUES ('walls', ?, ?, 'designer', ?, ?)", (wall_id, column, source, batch_id),
+    )
+
+
+def decisions_for(db_path: Path, target_id: str) -> list[DecisionRecord]:
+    """All decisions on an element, oldest first."""
+    conn = open_existing(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT decision_id, target_table, target_id, choice, reason, basis_kind, decided_on, batch_id, "
+            "premise, premise_valid FROM decisions WHERE target_id = ? ORDER BY decision_id", (target_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+    records = []
+    for d_id, table, t_id, choice, reason, basis, on, batch, premise, valid in rows:
+        premise = json.loads(premise)
+        for key in ("observed_geometry", "expected_geometry"):
+            premise[key] = tuple(tuple(p) for p in premise[key])
+        records.append(DecisionRecord(d_id, table, t_id, choice, reason, basis, on, batch, premise, bool(valid)))
+    return records
+
+
+def wall_status(db_path: Path, wall_id: str) -> str | None:
+    """How a decided wall stands now, computed from the decision and the current positions."""
+    conn = open_existing(db_path)
+    try:
+        return _wall_status(conn, wall_id)
+    finally:
+        conn.close()
+
+
+def _wall_status(conn, wall_id: str, tol: float = 1.0) -> str | None:
+    decision = latest_decision(conn, wall_id)
+    if decision is None:
+        return None
+    choice, _ = decision
+    row = conn.execute("SELECT follow_edge, adopted_geometry, observed_geometry FROM walls WHERE wall_id = ?",
+                       (wall_id,)).fetchone()
+    if row is None:
+        return None
+    follow, adopted, observed = row
+    if choice == ALIGN_TO_BOUNDARY:
+        return STATUS_APPROVED_NOT_ON_DRAWING if not _same(_geometry(adopted), _geometry(observed), tol) else None
+    return STATUS_APPROVED_EXCEPTION if follow == 0 else None
+
+
+def drawing_fix_proposals(db_path: Path) -> list[DrawingFixProposal]:
+    """Walls approved to a position the drawing does not show yet."""
+    conn = open_existing(db_path)
+    try:
+        proposals = []
+        for wall_id, adopted, observed in conn.execute(
+            "SELECT wall_id, adopted_geometry, observed_geometry FROM walls ORDER BY wall_id"
+        ).fetchall():
+            if _wall_status(conn, wall_id) == STATUS_APPROVED_NOT_ON_DRAWING:
+                proposals.append(DrawingFixProposal(wall_id, _geometry(adopted), _geometry(observed)))
+        return proposals
+    finally:
+        conn.close()
+
+
+def accepted_exceptions(db_path: Path) -> list[AcceptedException]:
+    """Walls that no longer follow their edge by decision, with the distance that remains."""
+    conn = open_existing(db_path)
+    try:
+        return _accepted_exceptions(conn)
+    finally:
+        conn.close()
+
+
+def _accepted_exceptions(conn, tol: float = 1.0) -> list[AcceptedException]:
+    result = []
+    for (wall_id,) in conn.execute("SELECT wall_id FROM walls ORDER BY wall_id").fetchall():
+        if _wall_status(conn, wall_id) != STATUS_APPROVED_EXCEPTION:
+            continue
+        deviation = wall_deviation_now(conn, wall_id, tol, regardless_of_follow=True)
+        edge_ids = [e for (e,) in conn.execute(
+            "SELECT edge_id FROM wall_edge_spans WHERE wall_id = ? ORDER BY seq", (wall_id,))]
+        result.append(AcceptedException(wall_id, deviation["distance_mm"] if deviation else 0.0, edge_ids))
+    return result
 
 
 def _same(a, b, tol: float = 1e-6) -> bool:
