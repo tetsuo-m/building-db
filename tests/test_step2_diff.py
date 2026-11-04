@@ -50,7 +50,6 @@ DECIDED_ON = "2026-11-04"
 # Marks for behavior that is not implemented yet. strict=True makes an
 # unexpected pass fail, so a mark cannot stay on a test that already works.
 # Remove a mark only with the approval of the project owner.
-NEEDS_DEVIATION = pytest.mark.xfail(strict=True, reason="a wall deviation is not reported as one item")
 NEEDS_VERSIONS = pytest.mark.xfail(strict=True, reason="building_db.versions is not implemented")
 
 EDGE_NAMES = {
@@ -374,7 +373,6 @@ def test_moved_review_flags(moved):
     assert "2800" in flag and "6000" not in flag
 
 
-@NEEDS_DEVIATION
 def test_moved_no_wall_deviation(moved):
     assert moved.result.wall_deviations == []
 
@@ -476,7 +474,6 @@ def test_boundary_only_wall_length(boundary_only):
     assert lengths[boundary_only.base.walls["partition"]] == pytest.approx(4.000)
 
 
-@NEEDS_DEVIATION
 def test_boundary_only_two_review_flags(boundary_only):
     # "要確認は2件": no room name, and one wall deviation naming both IDs and 500 mm
     base = boundary_only.base
@@ -489,14 +486,12 @@ def test_boundary_only_two_review_flags(boundary_only):
     assert "500" in other
 
 
-@NEEDS_DEVIATION
 def test_boundary_only_deviation_not_split(boundary_only):
     # "バラバラには出さない": not reported as "edge without wall" + "line on no edge"
     flags = boundary_only.result.review_flags
     assert not [f for f in flags if "has no wall" in f or "does not follow any boundary" in f]
 
 
-@NEEDS_DEVIATION
 def test_boundary_only_deviation_record(boundary_only):
     # "要確認は2件": the deviation offers two choices
     base = boundary_only.base

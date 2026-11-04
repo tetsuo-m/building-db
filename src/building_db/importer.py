@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 from dataclasses import dataclass, field
@@ -32,11 +33,40 @@ from building_db.tables import FinishRow, read_finish_schedule, read_wall_types
 _ROOM_LABEL = re.compile(r"^\s*(\S+)[\s　]+(.+?)\s*$")
 
 
+ALIGN_TO_BOUNDARY = "align_to_boundary"
+UNFOLLOW = "unfollow"
+
+
+@dataclass(frozen=True)
+class WallDeviation:
+    """A wall whose center line on the drawing left the boundary edge it follows.
+
+    The expected position is computed from the followed edges when needed and
+    never stored. The adopted position is not changed until a person decides.
+    """
+
+    wall_id: str
+    edge_ids: list[str]
+    distance_mm: float
+    expected_geometry: tuple  # ((x1, y1), (x2, y2)) along the followed edges
+    options: tuple[str, ...] = (ALIGN_TO_BOUNDARY, UNFOLLOW)
+
+    @property
+    def edge_id(self) -> str | None:
+        return self.edge_ids[0] if len(self.edge_ids) == 1 else None
+
+    @property
+    def expected_x_mm(self) -> float | None:
+        (x1, _), (x2, _) = self.expected_geometry
+        return x1 if abs(x1 - x2) <= 1e-6 else None
+
+
 @dataclass
 class ImportResult:
     batch_id: int
     review_flags: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    wall_deviations: list[WallDeviation] = field(default_factory=list)
     # Matching against the previous version: elements decided automatically,
     # and elements handed to a person (see match_log).
     match_counts: dict[str, int] = field(default_factory=lambda: {"auto": 0, "to_person": 0})
@@ -77,9 +107,10 @@ def import_drawing(
                 conn, drawing, network, node_ids, edge_ids, finish_rows,
                 Path(finish_schedule_csv).name, batch_id, flags, log,
             )
+            deviations: list[WallDeviation] = []
             wall_ids = _import_walls(
                 conn, drawing, network, edge_ids, type_ids[default_wall_type],
-                default_wall_type, batch_id, tol, flags, log,
+                default_wall_type, batch_id, tol, flags, log, deviations,
             )
             conn.execute(
                 "UPDATE import_batches SET review_flags = ? WHERE batch_id = ?",
@@ -93,6 +124,7 @@ def import_drawing(
         batch_id=batch_id,
         review_flags=flags,
         match_counts=match_counts,
+        wall_deviations=deviations,
         counts={
             "grids": len(drawing.grids),
             "nodes": len(node_ids),
@@ -442,7 +474,8 @@ def _match_rooms(conn, contours: list[_Contour], flags: list[str]):
 
 
 def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code, batch_id, tol,
-                  flags, log: _Log | None = None) -> list[str]:
+                  flags, log: _Log | None = None, deviations: list | None = None) -> list[str]:
+    deviations = [] if deviations is None else deviations
     wall_ids = []
     prev_wall_ids = [r[0] for r in conn.execute("SELECT wall_id FROM walls")]
     walls_per_edge: dict[str, int] = {eid: 0 for eid in edge_ids}
@@ -470,11 +503,15 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
 
     for i, (a, b) in enumerate(lines):
         spans = all_spans[i]
-        if not spans:
-            flags.append(f"Wall center line {a}-{b} does not follow any boundary line")
-
         wall_id = match.matched.get(i)
         geometry = json.dumps([list(a), list(b)])
+
+        # A matched wall whose line no longer lies on the edges it follows has
+        # deviated; the wall is not re-reported as a line on no edge.
+        deviation = _wall_deviation(conn, wall_id, (a, b), tol) if wall_id and not spans else None
+        if not spans and deviation is None:
+            flags.append(f"Wall center line {a}-{b} does not follow any boundary line")
+
         if wall_id is None:
             wall_id = next_id(conn, "walls", "wall_id", "A-WL-", 4)
             conn.execute(
@@ -486,21 +523,36 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
                 candidates = match.undecided.get(i)
                 log.write("walls", wall_id, "undecided" if candidates else "added_candidate",
                           candidates=candidates, review=bool(candidates))
-        else:
+        elif deviation is None:
             conn.execute(
                 "UPDATE walls SET wall_type_id = ?, adopted_geometry = ?, observed_geometry = ? WHERE wall_id = ?",
                 (type_id, geometry, geometry, wall_id),
             )
-            if log:
-                reason = match.reasons[i]
-                log.matched("walls", wall_id, reason.rule, reason.moved_mm, reason.anchors, tol)
+        else:
+            # Observed changes; adopted (and its provenance) stays until a person decides.
+            conn.execute("UPDATE walls SET wall_type_id = ?, observed_geometry = ? WHERE wall_id = ?",
+                         (type_id, geometry, wall_id))
+        if log and match.matched.get(i) is not None:
+            reason = match.reasons[i]
+            log.matched("walls", wall_id, reason.rule, reason.moved_mm, reason.anchors, tol)
+
         _set_provenance(conn, "walls", wall_id, "wall_type_id", "designer",
                         f"default wall type {type_code} given on the import command (--default-wall-type)",
                         batch_id)
-        _set_provenance(conn, "walls", wall_id, "adopted_geometry", "cad_import",
-                        f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
+        if deviation is None:
+            _set_provenance(conn, "walls", wall_id, "adopted_geometry", "cad_import",
+                            f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
         _set_provenance(conn, "walls", wall_id, "observed_geometry", "cad_import",
                         f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
+        if deviation is not None:
+            deviations.append(deviation)
+            where = (f"x = {deviation.expected_x_mm:.0f}" if deviation.expected_x_mm is not None
+                     else f"{deviation.expected_geometry}")
+            flags.append(
+                f"Wall {wall_id} is {deviation.distance_mm:.0f} mm away from boundary edge "
+                f"{', '.join(deviation.edge_ids)} it follows (expected {where}); "
+                f"choose {ALIGN_TO_BOUNDARY} or {UNFOLLOW}"
+            )
 
         if spans:
             conn.execute("DELETE FROM wall_edge_spans WHERE wall_id = ?", (wall_id,))
@@ -522,6 +574,31 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
         elif count > 1:
             flags.append(f"Boundary edge {eid} is followed by {count} walls")
     return wall_ids
+
+
+def _wall_deviation(conn, wall_id: str, line, tol: float) -> WallDeviation | None:
+    """How far the drawn line is from the edges the wall follows, if it follows any."""
+    (follow,) = conn.execute("SELECT follow_edge FROM walls WHERE wall_id = ?", (wall_id,)).fetchone()
+    if not follow:
+        return None
+    edge_ids = [e for (e,) in conn.execute(
+        "SELECT edge_id FROM wall_edge_spans WHERE wall_id = ? ORDER BY seq", (wall_id,))]
+    if not edge_ids:
+        return None
+    expected = expected_wall_geometry(conn, edge_ids)
+    distance = max(math.dist(line[0], expected[0]), math.dist(line[1], expected[1]))
+    if distance <= tol:
+        return None
+    return WallDeviation(wall_id, edge_ids, distance, expected)
+
+
+def expected_wall_geometry(conn, edge_ids: list[str]) -> tuple:
+    """Where a wall following these edges should be: the span of their nodes, ends sorted."""
+    marks = ",".join("?" * len(edge_ids))
+    points = [(x, y) for x, y in conn.execute(
+        f"""SELECT n.x, n.y FROM edges e JOIN nodes n ON n.node_id IN (e.node_start, e.node_end)
+            WHERE e.edge_id IN ({marks})""", edge_ids)]
+    return (min(points), max(points))
 
 
 def _wall_edges(conn) -> dict[str, set[str]]:
