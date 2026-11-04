@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS walls (
     wall_id          TEXT PRIMARY KEY,
     follow_edge      INTEGER NOT NULL DEFAULT 1,
     wall_type_id     TEXT REFERENCES wall_types(type_id),
-    adopted_geometry TEXT NOT NULL            -- JSON [[x1, y1], [x2, y2]] of the wall center
+    adopted_geometry TEXT NOT NULL,           -- JSON [[x1, y1], [x2, y2]] of the wall center
+    observed_geometry TEXT NOT NULL           -- same format, as seen on the latest drawing
 );
 
 CREATE TABLE IF NOT EXISTS wall_edge_spans (

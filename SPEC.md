@@ -85,7 +85,8 @@
 - 段階1で作る表（2026-11-03）：import_batches、grids、nodes、edges、rooms、room_boundaries、walls、wall_edge_spans、wall_types、field_provenance（最小限）。
 - 観測値・採用値・期待値の区別は、段階5からではなく、今から入れる（2026-11-03）。
   - walls に、`adopted_geometry`（採用位置）とは別に `observed_geometry`（図面で観測した位置）を持たせる。理由：`step2_boundary_only.dxf` のずれ（図面の線と採用する位置の食い違い）を扱うため。
-  - 実装（schema.sql など）はまだ。現在の walls には `adopted_geometry` だけがある。
+  - 実装済み（2026-11-04）。取り込むと、`observed_geometry` と `adopted_geometry` は、どちらも図面の壁芯線の位置になる。
+  - 既知の食い違い：現在の実装では、取り込み直すと `adopted_geometry` も図面の値で上書きされる。`expected_diff.md` の「承認がないので、勝手に動かさない」と合わないので、版の比較の作業で直す（2026-11-04）。
 - import_batches には、取り込んだファイル（名前・パス・SHA-256）と日時に加えて、読み取りの条件を記録する：読み取りの方法（recover モードか）、DXF の版、文字コードとそれを仮定したか、repairs、番号の重複、単位とそれを仮定したか、置き直す前の原点、要確認の一覧（2026-11-03）。
 - 段階1で使う ID の種別記号（2026-11-03、仮）：通り芯 A-GR-001、節点 A-ND-0001、境界線 A-BD-0001、部屋 A-RM-001、壁 A-WL-0001、壁の型 A-WT-001。
 - 取り込み直しでは、既にある要素を探して ID を引き継ぐ（2026-11-03）。通り芯は符号、節点は位置（許容差の内側）、境界線は両端の節点、部屋は境界線の組（なければ室番号）、壁は追従する境界線の組、壁の型は壁種記号で探す。

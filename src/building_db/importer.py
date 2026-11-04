@@ -285,16 +285,21 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
         if wall_id is None:
             wall_id = next_id(conn, "walls", "wall_id", "A-WL-", 4)
             conn.execute(
-                "INSERT INTO walls (wall_id, follow_edge, wall_type_id, adopted_geometry) VALUES (?, ?, ?, ?)",
-                (wall_id, 1 if spans else 0, type_id, geometry),
+                "INSERT INTO walls (wall_id, follow_edge, wall_type_id, adopted_geometry, observed_geometry) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (wall_id, 1 if spans else 0, type_id, geometry, geometry),
             )
         else:
-            conn.execute("UPDATE walls SET wall_type_id = ?, adopted_geometry = ? WHERE wall_id = ?",
-                         (type_id, geometry, wall_id))
+            conn.execute(
+                "UPDATE walls SET wall_type_id = ?, adopted_geometry = ?, observed_geometry = ? WHERE wall_id = ?",
+                (type_id, geometry, geometry, wall_id),
+            )
         _set_provenance(conn, "walls", wall_id, "wall_type_id", "designer",
                         f"default wall type {type_code} given on the import command (--default-wall-type)",
                         batch_id)
         _set_provenance(conn, "walls", wall_id, "adopted_geometry", "cad_import",
+                        f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
+        _set_provenance(conn, "walls", wall_id, "observed_geometry", "cad_import",
                         f"{drawing.path.name} layer {WALL_CENTER}", batch_id)
 
         conn.execute("DELETE FROM wall_edge_spans WHERE wall_id = ?", (wall_id,))
