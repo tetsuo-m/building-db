@@ -311,13 +311,55 @@ def test_new_number_and_new_shape_at_once_gets_a_new_id_and_is_reported(tmp_path
     assert has_flag(result.review_flags, before[6000], "split or merge")
 
 
-def test_two_contours_do_not_share_one_room_id(tmp_path):
+def drawing_in_order(tmp_path, name, boundary_xs, names, partitions_first):
+    """Like drawing(), but the order of the boundary lines in the file is chosen.
+
+    The order decides the order of the contours during import, which must not
+    change which room keeps which ID.
+    """
+    parts = partitions(*boundary_xs)
+    boundary = parts + SQUARE if partitions_first else SQUARE + parts
+    return build_dxf(tmp_path / f"{name}.dxf", boundary=boundary, walls=SQUARE + parts, names=names)
+
+
+@pytest.mark.parametrize("partitions_first", [False, True])
+def test_boundary_match_wins_over_room_number_in_any_order(tmp_path, partitions_first):
+    # Base: left room unnamed, right room 101. New: the left room is split again and
+    # its left part is named 101; the right room keeps its shape but loses its name.
+    # The right room must keep its ID by boundary; the part named 101 must not take it.
+    db = tmp_path / "b.sqlite"
+    import_version(db, drawing(tmp_path, "base", [2300]))
+    before = room_ids_by_xmax(db)
+    names = ((500.0, 2000.0, "101 事務室"),)
+    result = import_version(
+        db, drawing_in_order(tmp_path, "new", [1000, 2300], names, partitions_first))
+    rooms = dict(read_rows(db, "SELECT room_id, room_no FROM rooms"))
+    assert rooms[before[6000]] is None  # kept by boundary, now unnamed
+    assert room_ids_by_xmax(db)[6000] == before[6000]
+    named = [r for r, no in rooms.items() if no == "101"]
+    assert len(named) == 1 and named[0] not in before.values()  # a new room
+    assert has_flag(result.review_flags, "101", before[6000], "conflict")
+
+
+@pytest.mark.parametrize("partitions_first", [False, True])
+def test_room_number_claimed_by_two_contours_is_not_inherited(tmp_path, partitions_first):
+    # Base: one room 101. New: split in two, both halves named 101. Neither half
+    # can be told to be the old room, so neither inherits; the old room stays.
     db = tmp_path / "b.sqlite"
     import_version(db, drawing(tmp_path, "base"))
+    ((old_id,),) = read_rows(db, "SELECT room_id FROM rooms")
     names = ((1000.0, 2000.0, "101 事務室"), (4500.0, 2000.0, "101 事務室"))
-    import_version(db, drawing(tmp_path, "two", [2300], names=names))
-    assert len(read_rows(db, "SELECT room_id FROM rooms")) == 2
-    assert len(room_ids_by_xmax(db)) == 2
+    result = import_version(
+        db, drawing_in_order(tmp_path, "two", [2300], names, partitions_first))
+    # The two contours of the new drawing are the rooms bounded by the partition.
+    partition = edge_ids_by_points(db)[((2300, 0), (2300, 4000))]
+    contour_rooms = {r for (r,) in read_rows(
+        db, f"SELECT room_id FROM room_boundaries WHERE edge_id = '{partition}'")}
+    assert len(contour_rooms) == 2
+    assert old_id not in contour_rooms  # the old room is not carried into either contour
+    numbers = dict(read_rows(db, "SELECT room_id, room_no FROM rooms"))
+    assert all(numbers[r] == "101" for r in contour_rooms)  # each contour is its own new room
+    assert has_flag(result.review_flags, "101", "2 contours")
 
 
 # --- Walls: through the followed edges, then directly -----------------------------

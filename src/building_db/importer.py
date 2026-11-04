@@ -201,9 +201,9 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
     used_texts = set()
     finishes = {r.room_no: r for r in finish_rows}
     room_ids = []
-    prev_rooms = _room_edges(conn)
-    used_rooms: set[str] = set()
 
+    # Read every contour first, so that matching does not depend on their order.
+    contours: list[_Contour] = []
     for face in network.faces:
         polygon = [network.nodes[n] for n in face.nodes]
         inside = [i for i, t in enumerate(texts) if point_in_polygon((t.x, t.y), polygon)]
@@ -226,19 +226,17 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
         else:
             names = [texts[i].text for i in inside]
             flags.append(f"Contour {polygon} has {len(inside)} room name texts: {names}")
+        contours.append(_Contour(face, polygon, face_edge_ids, room_no, name, label_source))
 
-        room_id, same_boundary = _find_room(conn, prev_rooms, used_rooms, face_edge_ids, room_no)
+    matched = _match_rooms(conn, contours, flags)
+
+    for c in contours:
+        face, polygon, face_edge_ids, room_no, name, label_source = (
+            c.face, c.polygon, c.edge_ids, c.room_no, c.name, c.label_source)
+        room_id = matched.get(id(c))
         if room_id is None:
             room_id = next_id(conn, "rooms", "room_id", "A-RM-", 3)
             conn.execute("INSERT INTO rooms (room_id) VALUES (?)", (room_id,))
-            sharing = sorted(r for r, edges in prev_rooms.items() if edges & set(face_edge_ids))
-            if sharing:
-                flags.append(f"Contour {polygon} is new room {room_id}, sharing boundary edges with "
-                             f"{', '.join(sharing)} (possible split or merge)")
-        elif not same_boundary:
-            flags.append(f"Room {room_no}: boundary changed, {room_id} keeps its ID by room number only "
-                         "(possible split or merge)")
-        used_rooms.add(room_id)
         conn.execute("UPDATE rooms SET room_no = ?, name = ? WHERE room_id = ?", (room_no, name, room_id))
         if label_source:
             _set_provenance(conn, "rooms", room_id, "room_no", "cad_import", label_source, batch_id)
@@ -278,18 +276,69 @@ def _room_edges(conn) -> dict[str, set[str]]:
     return rooms
 
 
-def _find_room(conn, prev_rooms, used_rooms, face_edge_ids: list[str],
-               room_no: str | None) -> tuple[str | None, bool]:
-    """Return (room ID or None, True if the boundary edges are the same)."""
-    wanted = set(face_edge_ids)
-    for room_id, edges in prev_rooms.items():
-        if edges == wanted and room_id not in used_rooms:
-            return room_id, True
-    if room_no:
-        for (room_id,) in conn.execute("SELECT room_id FROM rooms WHERE room_no = ?", (room_no,)).fetchall():
-            if room_id not in used_rooms:
-                return room_id, False
-    return None, False
+@dataclass
+class _Contour:
+    """A closed contour of the new drawing, read before any room is matched."""
+
+    face: object
+    polygon: list
+    edge_ids: list[str]
+    room_no: str | None
+    name: str | None
+    label_source: str | None
+
+
+def _match_rooms(conn, contours: list[_Contour], flags: list[str]) -> dict[int, str]:
+    """Decide which previous room each contour is. Returns {id(contour): room_id}.
+
+    1. A contour with the same boundary edges as a previous room is that room.
+    2. A contour whose room number names a previous room not matched in step 1
+       is that room, but only if no other contour claims the same number.
+    Anything else is a new room. The result does not depend on contour order.
+    """
+    prev_rooms = _room_edges(conn)
+    numbers = dict(conn.execute("SELECT room_id, room_no FROM rooms WHERE room_no IS NOT NULL"))
+    matched: dict[int, str] = {}
+    taken: set[str] = set()
+
+    for c in contours:
+        wanted = set(c.edge_ids)
+        for room_id, edges in prev_rooms.items():
+            if edges == wanted and room_id not in taken:
+                matched[id(c)] = room_id
+                taken.add(room_id)
+                break
+
+    claims: dict[str, list[_Contour]] = {}
+    for c in contours:
+        if id(c) not in matched and c.room_no:
+            claims.setdefault(c.room_no, []).append(c)
+    for room_no, claimants in claims.items():
+        rooms_with_no = sorted(r for r, no in numbers.items() if no == room_no)
+        if len(claimants) > 1:
+            flags.append(f"Room number {room_no} is inside {len(claimants)} contours; "
+                         f"none of them keeps the ID of {', '.join(rooms_with_no) or 'a previous room'}")
+            continue
+        (c,) = claimants
+        free = [r for r in rooms_with_no if r not in taken]
+        if free and len(free) == len(rooms_with_no) == 1:
+            matched[id(c)] = free[0]
+            taken.add(free[0])
+            flags.append(f"Room {room_no}: boundary changed, {free[0]} keeps its ID by room number only "
+                         "(possible split or merge)")
+        elif rooms_with_no:
+            held = [r for r in rooms_with_no if r in taken]
+            flags.append(f"Room number {room_no} conflicts with {', '.join(held or rooms_with_no)}, "
+                         "which is matched by its boundary; the contour becomes a new room")
+
+    for c in contours:
+        if id(c) in matched:
+            continue
+        sharing = sorted(r for r, edges in prev_rooms.items() if edges & set(c.edge_ids))
+        if sharing:
+            flags.append(f"Contour {c.polygon} is a new room, sharing boundary edges with "
+                         f"{', '.join(sharing)} (possible split or merge)")
+    return matched
 
 
 def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code, batch_id, tol,
