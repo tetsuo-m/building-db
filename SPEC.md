@@ -81,6 +81,7 @@
 - 部屋割りは節点（nodes）と境界線（edges）の網として持つ。境界線の向きは DB が決め、CAD の線の向きには従わない（設計書）。
 - 採用値・観測値・期待値を混同しない（CLAUDE.md）。
 - 面積・長さ・数量などの計算値は保存しない（設計書）。
+  - 取り込みの時点の事実の記録は、計算値ではないので保存する（2026-11-04）。例：一致させたときの移動量（`moved_mm`）、判断の前提（`decisions` の `premise`）。現在の状態から計算する値ではなく、後から同じものを求められないため。
 
 - 段階1で作る表（2026-11-03）：import_batches、grids、nodes、edges、rooms、room_boundaries、walls、wall_edge_spans、wall_types、field_provenance（最小限）。
 - 観測値・採用値・期待値の区別は、段階5からではなく、今から入れる（2026-11-03）。
