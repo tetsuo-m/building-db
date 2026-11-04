@@ -277,15 +277,19 @@ def drawing_fix_proposals(db_path: Path) -> list[DrawingFixProposal]:
     """Walls approved to a position the drawing does not show yet."""
     conn = open_existing(db_path)
     try:
-        proposals = []
-        for wall_id, adopted, observed in conn.execute(
-            "SELECT wall_id, adopted_geometry, observed_geometry FROM walls ORDER BY wall_id"
-        ).fetchall():
-            if _wall_status(conn, wall_id) == STATUS_APPROVED_NOT_ON_DRAWING:
-                proposals.append(DrawingFixProposal(wall_id, _geometry(adopted), _geometry(observed)))
-        return proposals
+        return _drawing_fix_proposals(conn)
     finally:
         conn.close()
+
+
+def _drawing_fix_proposals(conn) -> list[DrawingFixProposal]:
+    proposals = []
+    for wall_id, adopted, observed in conn.execute(
+        "SELECT wall_id, adopted_geometry, observed_geometry FROM walls ORDER BY wall_id"
+    ).fetchall():
+        if _wall_status(conn, wall_id) == STATUS_APPROVED_NOT_ON_DRAWING:
+            proposals.append(DrawingFixProposal(wall_id, _geometry(adopted), _geometry(observed)))
+    return proposals
 
 
 def accepted_exceptions(db_path: Path) -> list[AcceptedException]:

@@ -21,22 +21,52 @@ def main(argv: list[str] | None = None) -> int:
     p_import.add_argument("--finish-schedule", type=Path, required=True)
     p_import.add_argument("--default-wall-type", required=True,
                           help="Wall type code given to every wall, e.g. WT-3")
+    p_import.add_argument("--no-snapshot", action="store_true",
+                          help="Do not copy an existing database into <db>.snapshots/ before importing")
 
     p_report = sub.add_parser("report", help="Show areas, perimeters and wall lengths")
     p_report.add_argument("--db", type=Path, required=True)
 
+    p_snapshot = sub.add_parser("snapshot", help="Copy the database as it is now")
+    p_snapshot.add_argument("--db", type=Path, required=True)
+    p_snapshot.add_argument("--to", type=Path, required=True, help="Path of the copy; must not exist")
+
+    p_diff = sub.add_parser("diff", help="Compare the latest version of two databases by ID")
+    p_diff.add_argument("--base", type=Path, required=True, help="The earlier database (e.g. a snapshot)")
+    p_diff.add_argument("--new", type=Path, required=True, help="The later database")
+
+    p_decide = sub.add_parser("decide", help="Record a person's decision on a wall deviation")
+    p_decide.add_argument("--db", type=Path, required=True)
+    p_decide.add_argument("--target", required=True, help="Wall ID, e.g. A-WL-0005")
+    p_decide.add_argument("--choice", required=True, choices=_choices())
+    p_decide.add_argument("--reason", help="A word or two on why (optional)")
+    p_decide.add_argument("--date", help="Date of the decision, ISO (default: today)")
+
     args = parser.parse_args(argv)
+    commands = {"import": _import, "report": _report, "snapshot": _snapshot, "diff": _diff, "decide": _decide}
     try:
-        if args.command == "import":
-            return _import(args)
-        return _report(args)
+        return commands[args.command](args)
     except SchemaVersionError as error:
         print(error, file=sys.stderr)
         return 1
+    except (ValueError, FileExistsError, FileNotFoundError) as error:
+        print(f"Nothing was changed: {error}")
+        return 1
+
+
+def _choices() -> tuple[str, ...]:
+    from building_db.versions import CHOICES
+
+    return CHOICES
 
 
 def _import(args) -> int:
     from building_db.importer import import_drawing
+    from building_db.versions import take_snapshot
+
+    if args.db.exists() and not args.no_snapshot:
+        snapshot = take_snapshot(args.db, _snapshot_path(args.db))
+        print(f"Snapshot of the previous version: {snapshot}")
 
     result = import_drawing(
         db_path=args.db,
@@ -57,6 +87,79 @@ def _import(args) -> int:
             print(f"  - {flag}")
     else:
         print("Review flags: none")
+    return 0
+
+
+def _snapshot_path(db: Path) -> Path:
+    """<db>.snapshots/v<latest batch>_<time>.sqlite, never an existing file."""
+    import sqlite3
+    from datetime import datetime
+
+    conn = sqlite3.connect(db)
+    try:
+        (batch,) = conn.execute("SELECT MAX(batch_id) FROM import_batches").fetchone()
+    except sqlite3.Error:
+        batch = None
+    finally:
+        conn.close()
+    folder = db.with_name(db.name + ".snapshots")
+    stem = f"v{batch if batch is not None else 0}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    path = folder / f"{stem}.sqlite"
+    n = 1
+    while path.exists():
+        n += 1
+        path = folder / f"{stem}_{n}.sqlite"
+    return path
+
+
+def _snapshot(args) -> int:
+    from building_db.versions import take_snapshot
+
+    if args.to.exists():
+        print(f"Nothing was changed: {args.to} already exists")
+        return 1
+    print(f"Snapshot written: {take_snapshot(args.db, args.to)}")
+    return 0
+
+
+def _diff(args) -> int:
+    from building_db.versions import diff_versions
+
+    diff = diff_versions(args.base, args.new)
+    print(f"Changes ({len(diff.changes)}) — {args.base} -> {args.new}")
+    for c in diff.changes:
+        print(f"  {c.kind} {c.element_id} {c.field}: {_fmt(c.before, c.field)} -> {_fmt(c.after, c.field)}")
+    print("Added: " + (", ".join(f"{a.kind} {a.element_id}" for a in diff.added) or "none"))
+    print("Missing: " + (", ".join(f"{m.kind} {m.element_id}" for m in diff.missing) or "none"))
+    if diff.missing:
+        print("  (missing elements stay in the DB; nothing is deleted)")
+    return 0
+
+
+def _fmt(value, field: str) -> str:
+    if isinstance(value, float):
+        if field.endswith("_m2"):
+            return f"{value:.2f}"
+        if field.endswith("_m"):
+            return f"{value:.3f}"
+        return f"{value:.0f}"
+    if isinstance(value, tuple):
+        return "(" + ", ".join(_fmt(v, "") for v in value) + ")"
+    if isinstance(value, list):
+        return "[" + ", ".join(str(v) for v in value) + "]"
+    return str(value)
+
+
+def _decide(args) -> int:
+    from building_db.versions import record_decision, wall_status
+
+    record = record_decision(args.db, args.target, args.choice, reason=args.reason, decided_on=args.date)
+    print(f"Recorded decision {record.decision_id}: {record.choice} on {record.target_id} "
+          f"({record.decided_on}, by a {record.basis_kind})")
+    if record.reason:
+        print(f"  reason: {record.reason}")
+    status = wall_status(args.db, args.target)
+    print(f"  status now: {status or 'no open item'}")
     return 0
 
 
@@ -88,7 +191,15 @@ def _report(args) -> int:
             print(f"  {wall_id}  {types.get(wall_id) or '-'}  {length:.3f} m")
         print(f"  total {sum(lengths.values()):.3f} m ({len(lengths)} walls)")
 
-        from building_db.versions import _accepted_exceptions
+        from building_db.versions import _accepted_exceptions, _drawing_fix_proposals
+
+        proposals = _drawing_fix_proposals(conn)
+        if proposals:
+            print("Approved positions not on the drawing yet (drawing fix proposals)")
+            for p in proposals:
+                where = f"x = {p.position_mm:.0f}" if p.position_mm is not None else _fmt(p.adopted_geometry, "")
+                print(f"  {p.wall_id}  move the wall center line to {where} "
+                      f"(drawn at {_fmt(p.observed_geometry, '')})")
 
         exceptions = _accepted_exceptions(conn)
         if exceptions:
