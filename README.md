@@ -13,6 +13,8 @@ folder, top to bottom. The virtual environment is used through its own
 
 Windows PowerShell と Python 3.11 以降で動きます。リポジトリのフォルダで、上から順に実行してください。仮想環境は `.venv\Scripts\python.exe` を直接使うので、有効化（Activate）は要りません。
 
+You need: Python 3.11 or later (`python --version`), and Git to clone the repository. / 必要なもの：Python 3.11 以降（`python --version` で確認）と、リポジトリを複製するための Git。
+
 ```powershell
 # 1. Create the virtual environment / 仮想環境を作る
 python -m venv .venv
