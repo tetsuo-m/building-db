@@ -11,7 +11,7 @@ import sqlite3
 from importlib import resources
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: last_seen_batch columns and match_log (2026-11-04)
 
 
 class SchemaVersionError(Exception):

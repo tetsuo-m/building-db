@@ -6,6 +6,7 @@ drawings made in a temporary folder.
 
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from conftest import DEFAULT_WALL_TYPE, FINISH_SCHEDULE_CSV, WALL_TYPES_CSV
 from test_step1_review import H, W, build_dxf
 
 SQUARE = [((0, 0), (W, 0)), ((W, 0), (W, H)), ((W, H), (0, H)), ((0, H), (0, 0))]
+STEP2_DIR = Path(__file__).resolve().parent.parent / "samples" / "step2"
 ROOM_101 = ((4500.0, 2000.0, "101 事務室"),)
 
 
@@ -441,15 +443,77 @@ def test_wall_with_more_than_one_candidate_is_not_decided(tmp_path):
     assert has_flag(result.review_flags, *old, "more than one")
 
 
-def test_wall_over_a_changed_number_of_edges_is_reported(tmp_path):
-    # SPEC.md 8 (d): the south wall now spans two edges and touches a new wall
+def test_moved_wall_spanning_a_changed_number_of_edges_is_not_matched(tmp_path):
+    # SPEC.md 8 (d), narrowed: a wall that moved AND now spans a different number
+    # of edges keeps no ID and is reported. The partition moves 2300 -> 2800 while
+    # a new horizontal partition splits it into two edges.
+    db = tmp_path / "b.sqlite"
+    import_version(db, drawing(tmp_path, "base", [2300]))
+    before = wall_ids_by_line(db)
+    old_partition = before[line_at(2300)][0]
+    new_lines = [((2800, 0), (2800, H)), ((2800, 2000), (W, 2000))]
+    result = import_version(db, build_dxf(
+        tmp_path / "moved_split.dxf", boundary=SQUARE + new_lines, walls=SQUARE + new_lines, names=ROOM_101))
+    after = wall_ids_by_line(db)
+    assert after[line_at(2800)] != [old_partition]
+    assert old_partition in after[line_at(2300)]  # the old wall stays in the DB
+    spans = dict(read_rows(db, "SELECT wall_id, COUNT(*) FROM wall_edge_spans GROUP BY wall_id"))
+    assert spans[after[line_at(2800)][0]] == 2
+    assert has_flag(result.review_flags, old_partition, "connections changed")
+    # The outer walls did not move and keep their IDs regardless
+    for line in (SOUTH, NORTH):
+        assert after[line] == before[line]
+
+
+WALL_MATCHING_WORDS = ("connections changed", "over the limit", "more than one match")
+
+
+def wall_matching_flags(flags):
+    return [f for f in flags if "Wall" in f and any(w in f for w in WALL_MATCHING_WORDS)]
+
+
+def test_step1_to_step2_keeps_the_outer_wall_ids(tmp_path):
+    # Design doc T11: adding the partition does not split the south and north
+    # walls; each stays one wall over two edges. Their IDs must not change,
+    # or decisions attached to them would be lost (SPEC.md 8 (c)).
+    from conftest import SAMPLES
+
+    db = tmp_path / "b.sqlite"
+    import_version(db, SAMPLES / "step1.dxf")
+    before = wall_ids_by_line(db)
+    result = import_version(db, STEP2_DIR / "step2.dxf")
+    after = wall_ids_by_line(db)
+    assert count_walls(db) == 5
+    for line in (SOUTH, NORTH, (0, 0, 0, 4000), (6000, 0, 6000, 4000)):
+        assert after[line] == before[line]
+    spans = dict(read_rows(db, "SELECT wall_id, COUNT(*) FROM wall_edge_spans GROUP BY wall_id"))
+    assert spans[after[SOUTH][0]] == 2 and spans[after[NORTH][0]] == 2
+    assert wall_matching_flags(result.review_flags) == []
+
+
+def test_removing_the_partition_keeps_the_outer_wall_ids(tmp_path):
+    # The reverse of T11: the south and north walls go back to one edge each
+    db = tmp_path / "b.sqlite"
+    import_version(db, drawing(tmp_path, "base", [2300]))
+    before = wall_ids_by_line(db)
+    result = import_version(db, drawing(tmp_path, "merged"))
+    after = wall_ids_by_line(db)
+    for line in (SOUTH, NORTH, (0, 0, 0, 4000), (6000, 0, 6000, 4000)):
+        assert after[line] == before[line]
+    assert wall_matching_flags(result.review_flags) == []
+
+
+def test_unmoved_wall_is_an_anchor_in_the_log(tmp_path):
     db = tmp_path / "b.sqlite"
     import_version(db, drawing(tmp_path, "base"))
-    before = wall_ids_by_line(db)
+    south = wall_ids_by_line(db)[SOUTH][0]
     result = import_version(db, drawing(tmp_path, "added", [2300]))
-    assert wall_ids_by_line(db)[SOUTH] != before[SOUTH]
-    assert has_flag(result.review_flags, before[SOUTH][0], "connections changed")
-    assert has_flag(result.review_flags, before[NORTH][0], "connections changed")
+    rows = read_rows(
+        db,
+        f"SELECT classification, rule, moved_mm FROM match_log "
+        f"WHERE batch_id = {result.batch_id} AND target_table = 'walls' AND target_id = '{south}'",
+    )
+    assert rows == [("match", "same_position", 0.0)]
 
 
 def test_wall_without_a_boundary_keeps_its_id_on_reimport(tmp_path):

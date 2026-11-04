@@ -32,6 +32,8 @@ class NodeMatch:
     matched: dict[int, str] = field(default_factory=dict)  # new node index -> previous node ID
     reasons: dict[int, MatchReason] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
+    # New nodes that may be a previous node but could not be decided: index -> candidate IDs
+    undecided: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
 
 def match_nodes(
@@ -115,7 +117,9 @@ def match_nodes(
         found = candidates_of(i)
         if found:
             result.problems.append(f"{where}: more than one match is possible ({', '.join(found)})")
+            result.undecided[i] = tuple(found)
             continue
+        maybe = []
         for p in prev_nodes:
             if p in taken:
                 continue
@@ -125,8 +129,12 @@ def match_nodes(
                     f"{where} may be {p}, moved {moved:.0f} mm, over the limit of {max_move:.0f} mm "
                     "(candidate for removed + added)"
                 )
+                maybe.append(p)
             elif known & prev_adj[p]:
                 result.problems.append(f"{where} may be {p}, but its connections changed")
+                maybe.append(p)
+        if maybe:
+            result.undecided[i] = tuple(maybe)
     return result
 
 
@@ -135,6 +143,7 @@ class WallMatch:
     matched: dict[int, str] = field(default_factory=dict)  # new line index -> previous wall ID
     reasons: dict[int, MatchReason] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
+    undecided: dict[int, tuple[str, ...]] = field(default_factory=dict)
 
 
 def match_walls(
@@ -147,14 +156,26 @@ def match_walls(
     """Match wall center lines to previous walls.
 
     by_edges holds the lines already matched through the edges they follow.
-    The other lines are compared directly: same direction, same touching walls
-    and a small move (SPEC.md 8 (c)).
+    A line in the same place as a previous wall is that wall (an anchor), even
+    if the edges it spans or the walls it touches changed: adding or removing
+    a partition must not change the ID of an outer wall (SPEC.md 8 (c)).
+    The remaining lines moved; they are compared directly: same direction,
+    same touching walls and a small move.
     """
     result = WallMatch()
     for i, wall_id in by_edges.items():
         result.matched[i] = wall_id
         result.reasons[i] = MatchReason("wall_span", _line_move(new_lines[i], prev_walls[wall_id]))
     taken = set(by_edges.values())
+
+    for i, seg in enumerate(new_lines):
+        if i in result.matched:
+            continue
+        same_place = [w for w, prev in prev_walls.items() if w not in taken and _line_move(seg, prev) <= tol]
+        if len(same_place) == 1:
+            result.matched[i] = same_place[0]
+            result.reasons[i] = MatchReason("same_position", 0.0)
+            taken.add(same_place[0])
 
     prev_touch = {w: {o for o, other in prev_walls.items() if o != w and _touching(seg, other, tol)}
                   for w, seg in prev_walls.items()}
@@ -198,7 +219,9 @@ def match_walls(
         found = candidates_of(i)
         if found:
             result.problems.append(f"{where}: more than one match is possible ({', '.join(found)})")
+            result.undecided[i] = tuple(found)
             continue
+        maybe = []
         for w, prev in prev_walls.items():
             if w in taken or not _parallel(seg, prev):
                 continue
@@ -208,8 +231,12 @@ def match_walls(
                     f"{where} may be {w}, moved {moved:.0f} mm, over the limit of {max_move:.0f} mm "
                     "(candidate for removed + added)"
                 )
+                maybe.append(w)
             elif moved <= max_move:
                 result.problems.append(f"{where} may be {w}, but its connections changed")
+                maybe.append(w)
+        if maybe:
+            result.undecided[i] = tuple(maybe)
     return result
 
 

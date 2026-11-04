@@ -45,10 +45,18 @@ def room_perimeter_m(conn: sqlite3.Connection, room_id: str) -> float:
     return sum(math.dist(p, q) for p, q in zip(points, points[1:] + points[:1])) / 1000
 
 
+LATEST_BATCH = "(SELECT MAX(batch_id) FROM import_batches)"
+
+
 def wall_lengths_m(conn: sqlite3.Connection) -> dict[str, float]:
-    """Wall center length of every wall, in m, keyed by wall_id."""
+    """Wall center length of every wall on the latest drawing, in m, keyed by wall_id.
+
+    Walls no longer on the drawing stay in the DB but are not counted.
+    """
     lengths = {}
-    for wall_id, geometry in conn.execute("SELECT wall_id, adopted_geometry FROM walls ORDER BY wall_id"):
+    for wall_id, geometry in conn.execute(
+        f"SELECT wall_id, adopted_geometry FROM walls WHERE last_seen_batch = {LATEST_BATCH} ORDER BY wall_id"
+    ):
         (x1, y1), (x2, y2) = json.loads(geometry)
         lengths[wall_id] = math.dist((x1, y1), (x2, y2)) / 1000
     return lengths

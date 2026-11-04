@@ -48,6 +48,9 @@ def _import(args) -> int:
     print(f"Imported {args.dxf} as batch {result.batch_id}")
     for name, count in result.counts.items():
         print(f"  {name}: {count}")
+    m = result.match_counts
+    print(f"Matching against the previous version: {m['auto']} matched automatically, "
+          f"{m['to_person']} for a person to check")
     if result.review_flags:
         print(f"Review flags ({len(result.review_flags)}):")
         for flag in result.review_flags:
@@ -58,7 +61,7 @@ def _import(args) -> int:
 
 
 def _report(args) -> int:
-    from building_db.calc import room_area_m2, room_perimeter_m, wall_lengths_m
+    from building_db.calc import LATEST_BATCH, room_area_m2, room_perimeter_m, wall_lengths_m
     from building_db.db import open_existing
 
     if not args.db.exists():
@@ -67,7 +70,10 @@ def _report(args) -> int:
     conn = open_existing(args.db)
     try:
         print("Rooms (measured on wall centers; calculated, not stored)")
-        rooms = conn.execute("SELECT room_id, room_no, name, ceiling_height FROM rooms ORDER BY room_id").fetchall()
+        rooms = conn.execute(
+            "SELECT room_id, room_no, name, ceiling_height FROM rooms "
+            f"WHERE last_seen_batch = {LATEST_BATCH} ORDER BY room_id"
+        ).fetchall()
         for room_id, room_no, name, ceiling in rooms:
             area = room_area_m2(conn, room_id)
             perimeter = room_perimeter_m(conn, room_id)
@@ -81,6 +87,17 @@ def _report(args) -> int:
         for wall_id, length in lengths.items():
             print(f"  {wall_id}  {types.get(wall_id) or '-'}  {length:.3f} m")
         print(f"  total {sum(lengths.values()):.3f} m ({len(lengths)} walls)")
+
+        gone = conn.execute(
+            "SELECT 'room', room_id, last_seen_batch FROM rooms "
+            f"WHERE last_seen_batch IS NOT {LATEST_BATCH} "
+            "UNION ALL SELECT 'wall', wall_id, last_seen_batch FROM walls "
+            f"WHERE last_seen_batch IS NOT {LATEST_BATCH} ORDER BY 2"
+        ).fetchall()
+        if gone:
+            print("Not on the latest drawing (kept in the DB)")
+            for kind, element_id, batch in gone:
+                print(f"  {element_id}  {kind}  last seen in batch {batch if batch is not None else '-'}")
     finally:
         conn.close()
     return 0

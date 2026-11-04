@@ -37,6 +37,9 @@ class ImportResult:
     batch_id: int
     review_flags: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(default_factory=dict)
+    # Matching against the previous version: elements decided automatically,
+    # and elements handed to a person (see match_log).
+    match_counts: dict[str, int] = field(default_factory=lambda: {"auto": 0, "to_person": 0})
 
 
 def import_drawing(
@@ -64,28 +67,32 @@ def import_drawing(
     try:
         with conn:  # one transaction
             batch_id = _insert_batch(conn, dxf_path, drawing)
+            # Reasons are logged only when there is a previous version to match against.
+            log = _Log(conn, batch_id) if _has_previous_import(conn, batch_id) else None
             type_ids = _upsert_wall_types(conn, wall_type_rows)
             _upsert_grids(conn, drawing)
-            node_ids = _import_nodes(conn, network, tol, flags)
-            edge_ids = [_edge_id(conn, node_ids[e.start], node_ids[e.end]) for e in network.edges]
+            node_ids, node_moves = _import_nodes(conn, network, tol, flags, batch_id, log)
+            edge_ids = _import_edges(conn, network, node_ids, node_moves, batch_id, log)
             room_ids = _import_rooms(
                 conn, drawing, network, node_ids, edge_ids, finish_rows,
-                Path(finish_schedule_csv).name, batch_id, flags,
+                Path(finish_schedule_csv).name, batch_id, flags, log,
             )
             wall_ids = _import_walls(
                 conn, drawing, network, edge_ids, type_ids[default_wall_type],
-                default_wall_type, batch_id, tol, flags,
+                default_wall_type, batch_id, tol, flags, log,
             )
             conn.execute(
                 "UPDATE import_batches SET review_flags = ? WHERE batch_id = ?",
                 (json.dumps(flags, ensure_ascii=False), batch_id),
             )
+            match_counts = _match_counts(conn, batch_id)
     finally:
         conn.close()
 
     return ImportResult(
         batch_id=batch_id,
         review_flags=flags,
+        match_counts=match_counts,
         counts={
             "grids": len(drawing.grids),
             "nodes": len(node_ids),
@@ -127,6 +134,50 @@ def _insert_batch(conn: sqlite3.Connection, dxf_path: Path, drawing: Drawing) ->
     return cur.lastrowid
 
 
+def _has_previous_import(conn, batch_id: int) -> bool:
+    return conn.execute("SELECT COUNT(*) FROM import_batches WHERE batch_id != ?", (batch_id,)).fetchone()[0] > 0
+
+
+class _Log:
+    """Writes match_log rows for one import batch."""
+
+    def __init__(self, conn, batch_id: int) -> None:
+        self.conn = conn
+        self.batch_id = batch_id
+
+    def write(self, table: str, target_id: str, classification: str, rule: str | None = None,
+              anchors=None, moved_mm: float | None = None, candidates=None, review: bool = False) -> None:
+        self.conn.execute(
+            "INSERT INTO match_log (batch_id, target_table, target_id, classification, rule, anchors, "
+            "moved_mm, candidates, review) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (self.batch_id, table, target_id, classification, rule,
+             json.dumps(sorted(anchors)) if anchors else None, moved_mm,
+             json.dumps(sorted(candidates)) if candidates else None, int(review)),
+        )
+
+    def matched(self, table: str, target_id: str, rule: str, moved_mm: float, anchors=(), tol: float = 1.0,
+                review: bool = False) -> None:
+        self.write(table, target_id, "moved" if moved_mm > tol else "match", rule, anchors, moved_mm,
+                   review=review)
+
+    def missing(self, table: str, previous_ids, seen_ids) -> None:
+        for target_id in sorted(set(previous_ids) - set(seen_ids)):
+            self.write(table, target_id, "missing_candidate")
+
+
+def _mark_seen(conn, table: str, id_column: str, ids, batch_id: int) -> None:
+    conn.executemany(f"UPDATE {table} SET last_seen_batch = ? WHERE {id_column} = ?",
+                     [(batch_id, i) for i in set(ids)])
+
+
+def _match_counts(conn, batch_id: int) -> dict[str, int]:
+    auto, to_person = conn.execute(
+        "SELECT SUM(review = 0 AND classification IN ('match', 'moved')), SUM(review = 1) "
+        "FROM match_log WHERE batch_id = ?", (batch_id,)
+    ).fetchone()
+    return {"auto": auto or 0, "to_person": to_person or 0}
+
+
 def _set_provenance(conn, table, target_id, column, origin, source, batch_id) -> None:
     conn.execute(
         "INSERT OR REPLACE INTO field_provenance "
@@ -163,8 +214,9 @@ def _upsert_grids(conn, drawing: Drawing) -> None:
                          (next_id(conn, "grids", "grid_id", "A-GR-", 3), g.label, g.direction, g.position))
 
 
-def _import_nodes(conn, network: Network, tol: float, flags: list[str]) -> list[str]:
-    """Return the node ID of each network node, keeping the IDs of matched nodes."""
+def _import_nodes(conn, network: Network, tol: float, flags: list[str], batch_id: int,
+                  log: _Log | None) -> tuple[list[str], dict[str, float]]:
+    """Return the node ID of each network node and how far each matched node moved."""
     prev_nodes = {node_id: (x, y) for node_id, x, y in conn.execute("SELECT node_id, x, y FROM nodes")}
     prev_edges = conn.execute("SELECT node_start, node_end FROM edges").fetchall()
     match = match_nodes(prev_nodes, prev_edges, network.nodes,
@@ -172,31 +224,60 @@ def _import_nodes(conn, network: Network, tol: float, flags: list[str]) -> list[
     flags.extend(match.problems)
 
     node_ids = []
+    moves: dict[str, float] = {}
     for i, (x, y) in enumerate(network.nodes):
         node_id = match.matched.get(i)
         if node_id is None:
             node_id = next_id(conn, "nodes", "node_id", "A-ND-", 4)
             conn.execute("INSERT INTO nodes (node_id, x, y) VALUES (?, ?, ?)", (node_id, x, y))
-        elif match.reasons[i].rule != "same_position":
-            conn.execute("UPDATE nodes SET x = ?, y = ? WHERE node_id = ?", (x, y, node_id))
+            if log:
+                candidates = match.undecided.get(i)
+                log.write("nodes", node_id, "undecided" if candidates else "added_candidate",
+                          candidates=candidates, review=bool(candidates))
+        else:
+            reason = match.reasons[i]
+            moves[node_id] = reason.moved_mm
+            if reason.rule != "same_position":
+                conn.execute("UPDATE nodes SET x = ?, y = ? WHERE node_id = ?", (x, y, node_id))
+            if log:
+                log.matched("nodes", node_id, reason.rule, reason.moved_mm, reason.anchors, tol)
         node_ids.append(node_id)
-    return node_ids
+    if log:
+        log.missing("nodes", prev_nodes, node_ids)
+    _mark_seen(conn, "nodes", "node_id", node_ids, batch_id)
+    return node_ids, moves
 
 
-def _edge_id(conn, start_id: str, end_id: str) -> str:
-    found = conn.execute(
-        "SELECT edge_id FROM edges WHERE node_start = ? AND node_end = ?", (start_id, end_id)
-    ).fetchone()
-    if found:
-        return found[0]
-    edge_id = next_id(conn, "edges", "edge_id", "A-BD-", 4)
-    conn.execute("INSERT INTO edges (edge_id, node_start, node_end) VALUES (?, ?, ?)",
-                 (edge_id, start_id, end_id))
-    return edge_id
+def _import_edges(conn, network: Network, node_ids, node_moves: dict[str, float], batch_id: int,
+                  log: _Log | None) -> list[str]:
+    """Return the edge ID of each network edge; an edge is the same if both its nodes are."""
+    prev_edges = [r[0] for r in conn.execute("SELECT edge_id FROM edges")]
+    edge_ids = []
+    for e in network.edges:
+        start_id, end_id = node_ids[e.start], node_ids[e.end]
+        found = conn.execute(
+            "SELECT edge_id FROM edges WHERE node_start = ? AND node_end = ?", (start_id, end_id)
+        ).fetchone()
+        if found:
+            edge_id = found[0]
+            if log:
+                moved = max(node_moves.get(start_id, 0.0), node_moves.get(end_id, 0.0))
+                log.matched("edges", edge_id, "both_end_nodes", moved, (start_id, end_id))
+        else:
+            edge_id = next_id(conn, "edges", "edge_id", "A-BD-", 4)
+            conn.execute("INSERT INTO edges (edge_id, node_start, node_end) VALUES (?, ?, ?)",
+                         (edge_id, start_id, end_id))
+            if log:
+                log.write("edges", edge_id, "added_candidate")
+        edge_ids.append(edge_id)
+    if log:
+        log.missing("edges", prev_edges, edge_ids)
+    _mark_seen(conn, "edges", "edge_id", edge_ids, batch_id)
+    return edge_ids
 
 
 def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_rows: list[FinishRow],
-                  finish_name: str, batch_id, flags) -> list[str]:
+                  finish_name: str, batch_id, flags, log: _Log | None = None) -> list[str]:
     texts = drawing.texts_on(ROOM_NAME)
     used_texts = set()
     finishes = {r.room_no: r for r in finish_rows}
@@ -228,7 +309,8 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
             flags.append(f"Contour {polygon} has {len(inside)} room name texts: {names}")
         contours.append(_Contour(face, polygon, face_edge_ids, room_no, name, label_source))
 
-    matched = _match_rooms(conn, contours, flags)
+    prev_room_ids = [r[0] for r in conn.execute("SELECT room_id FROM rooms")]
+    matched, decisions = _match_rooms(conn, contours, flags)
 
     for c in contours:
         face, polygon, face_edge_ids, room_no, name, label_source = (
@@ -237,6 +319,9 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
         if room_id is None:
             room_id = next_id(conn, "rooms", "room_id", "A-RM-", 3)
             conn.execute("INSERT INTO rooms (room_id) VALUES (?)", (room_id,))
+        if log:
+            classification, rule, candidates, review = decisions[id(c)]
+            log.write("rooms", room_id, classification, rule, candidates=candidates, review=review)
         conn.execute("UPDATE rooms SET room_no = ?, name = ? WHERE room_id = ?", (room_no, name, room_id))
         if label_source:
             _set_provenance(conn, "rooms", room_id, "room_no", "cad_import", label_source, batch_id)
@@ -265,6 +350,9 @@ def _import_rooms(conn, drawing, network: Network, node_ids, edge_ids, finish_ro
     for i, t in enumerate(texts):
         if i not in used_texts:
             flags.append(f"Room name text '{t.text}' at ({t.x:.0f}, {t.y:.0f}) is not inside any contour")
+    if log:
+        log.missing("rooms", prev_room_ids, room_ids)
+    _mark_seen(conn, "rooms", "room_id", room_ids, batch_id)
     return room_ids
 
 
@@ -288,8 +376,11 @@ class _Contour:
     label_source: str | None
 
 
-def _match_rooms(conn, contours: list[_Contour], flags: list[str]) -> dict[int, str]:
-    """Decide which previous room each contour is. Returns {id(contour): room_id}.
+def _match_rooms(conn, contours: list[_Contour], flags: list[str]):
+    """Decide which previous room each contour is.
+
+    Returns ({id(contour): room_id}, {id(contour): (classification, rule,
+    candidates, review)}) — the second for match_log.
 
     1. A contour with the same boundary edges as a previous room is that room.
     2. A contour whose room number names a previous room not matched in step 1
@@ -299,6 +390,7 @@ def _match_rooms(conn, contours: list[_Contour], flags: list[str]) -> dict[int, 
     prev_rooms = _room_edges(conn)
     numbers = dict(conn.execute("SELECT room_id, room_no FROM rooms WHERE room_no IS NOT NULL"))
     matched: dict[int, str] = {}
+    decisions: dict[int, tuple] = {}
     taken: set[str] = set()
 
     for c in contours:
@@ -306,6 +398,7 @@ def _match_rooms(conn, contours: list[_Contour], flags: list[str]) -> dict[int, 
         for room_id, edges in prev_rooms.items():
             if edges == wanted and room_id not in taken:
                 matched[id(c)] = room_id
+                decisions[id(c)] = ("match", "boundary_set", None, False)
                 taken.add(room_id)
                 break
 
@@ -318,11 +411,14 @@ def _match_rooms(conn, contours: list[_Contour], flags: list[str]) -> dict[int, 
         if len(claimants) > 1:
             flags.append(f"Room number {room_no} is inside {len(claimants)} contours; "
                          f"none of them keeps the ID of {', '.join(rooms_with_no) or 'a previous room'}")
+            for c in claimants:
+                decisions[id(c)] = ("undecided", "room_number", rooms_with_no or None, True)
             continue
         (c,) = claimants
         free = [r for r in rooms_with_no if r not in taken]
         if free and len(free) == len(rooms_with_no) == 1:
             matched[id(c)] = free[0]
+            decisions[id(c)] = ("match", "room_number", None, True)
             taken.add(free[0])
             flags.append(f"Room {room_no}: boundary changed, {free[0]} keeps its ID by room number only "
                          "(possible split or merge)")
@@ -330,20 +426,25 @@ def _match_rooms(conn, contours: list[_Contour], flags: list[str]) -> dict[int, 
             held = [r for r in rooms_with_no if r in taken]
             flags.append(f"Room number {room_no} conflicts with {', '.join(held or rooms_with_no)}, "
                          "which is matched by its boundary; the contour becomes a new room")
+            decisions[id(c)] = ("undecided", "room_number", rooms_with_no, True)
 
     for c in contours:
-        if id(c) in matched:
+        if id(c) in matched or id(c) in decisions:
             continue
         sharing = sorted(r for r, edges in prev_rooms.items() if edges & set(c.edge_ids))
         if sharing:
             flags.append(f"Contour {c.polygon} is a new room, sharing boundary edges with "
                          f"{', '.join(sharing)} (possible split or merge)")
-    return matched
+            decisions[id(c)] = ("undecided", None, sharing, True)
+        else:
+            decisions[id(c)] = ("added_candidate", None, None, False)
+    return matched, decisions
 
 
 def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code, batch_id, tol,
-                  flags) -> list[str]:
+                  flags, log: _Log | None = None) -> list[str]:
     wall_ids = []
+    prev_wall_ids = [r[0] for r in conn.execute("SELECT wall_id FROM walls")]
     walls_per_edge: dict[str, int] = {eid: 0 for eid in edge_ids}
 
     lines = [tuple(sorted([(ln.x1, ln.y1), (ln.x2, ln.y2)])) for ln in drawing.lines_on(WALL_CENTER)]
@@ -381,11 +482,18 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
                 "VALUES (?, ?, ?, ?, ?)",
                 (wall_id, 1 if spans else 0, type_id, geometry, geometry),
             )
+            if log:
+                candidates = match.undecided.get(i)
+                log.write("walls", wall_id, "undecided" if candidates else "added_candidate",
+                          candidates=candidates, review=bool(candidates))
         else:
             conn.execute(
                 "UPDATE walls SET wall_type_id = ?, adopted_geometry = ?, observed_geometry = ? WHERE wall_id = ?",
                 (type_id, geometry, geometry, wall_id),
             )
+            if log:
+                reason = match.reasons[i]
+                log.matched("walls", wall_id, reason.rule, reason.moved_mm, reason.anchors, tol)
         _set_provenance(conn, "walls", wall_id, "wall_type_id", "designer",
                         f"default wall type {type_code} given on the import command (--default-wall-type)",
                         batch_id)
@@ -404,6 +512,9 @@ def _import_walls(conn, drawing, network: Network, edge_ids, type_id, type_code,
             if eid in walls_per_edge:
                 walls_per_edge[eid] += 1
         wall_ids.append(wall_id)
+    if log:
+        log.missing("walls", prev_wall_ids, wall_ids)
+    _mark_seen(conn, "walls", "wall_id", wall_ids, batch_id)
 
     for eid, count in walls_per_edge.items():
         if count == 0:
